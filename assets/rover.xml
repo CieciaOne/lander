@@ -1,0 +1,289 @@
+<mujoco model="rover">
+  <!-- Mars rover with passive rocker-bogie suspension and 6 driven wheels (skid steer).
+       Authored from scratch with sane collision primitives; the original URDF in
+       data/my_rover has authoring bugs (collision meshes positioned in base_link frame
+       instead of their own link frame), so we do not include it directly. -->
+
+  <compiler angle="radian" autolimits="true"/>
+  <!-- Solver tuned for rolling+scrubbing wheel contacts on a rocker-bogie chassis.
+       implicitfast handles stiff joint damping; Newton + elliptic friction cone +
+       extra iterations give clean static-friction resolution (without this the
+       wheels can hop or the chassis can lift during in-place turns). -->
+  <option timestep="0.005" gravity="0 0 -3.71" integrator="implicitfast"
+          solver="Newton" iterations="150" tolerance="1e-10"
+          cone="elliptic" impratio="3"/>
+
+  <default>
+    <joint armature="0.01" damping="1"/>
+    <geom contype="1" conaffinity="1" condim="3" friction="1.0 0.05 0.001"/>
+    <default class="chassis">
+      <geom rgba="0.85 0.7 0.4 1"/>
+    </default>
+    <default class="rocker">
+      <geom rgba="0.5 0.5 0.55 1"/>
+    </default>
+    <default class="wheel">
+      <!-- Friction tuned for both grip (so the corner wheels can spin the rover in
+           place against middle-wheel scrub) and stability (so the chassis CoM is
+           low enough to absorb the lateral scrub torque without lifting wheels). -->
+      <geom type="cylinder" rgba="0.15 0.15 0.18 1" friction="1.8 0.1 0.01"/>
+    </default>
+    <default class="arm">
+      <!-- density 300 keeps arm bodies light (~0.4–0.8 kg each) without explicit inertials -->
+      <geom rgba="0.7 0.7 0.7 1" density="300"/>
+    </default>
+    <default class="drive">
+      <!-- Lower gain + forcerange than a typical robot: prevents the wheel velocity
+           actuator from dumping huge torque into the wheel during slip (which used
+           to pump the bogie up during in-place spin). With kv=30 the actuator can
+           still hold commanded velocity on level ground but won't go ballistic
+           when the wheel is sliding. -->
+      <general dyntype="none" gaintype="fixed" biastype="affine"
+               gainprm="30 0 0" biasprm="0 0 -30"
+               ctrlrange="-3.0 3.0" forcerange="-60 60"/>
+    </default>
+    <default class="steer">
+      <!-- Position-controlled steering: ctrl = desired joint angle (rad).
+           ±1 rad ≈ ±57°, enough for general nav; real Curiosity goes to ±90° for K-turns. -->
+      <position kp="600" kv="30" ctrlrange="-1.0 1.0" forcerange="-250 250"/>
+    </default>
+    <default class="armjoint">
+      <!-- Position-controlled arm joint: ctrl = desired angle (rad). -->
+      <position kp="80" kv="8" forcerange="-50 50"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 0.75">
+      <freejoint name="root"/>
+      <site name="imu" pos="0 0 0"/>
+      <!-- Chassis mass + inertia. Real Curiosity/Perseverance chassis (WEB + battery
+           + RTG + electronics) is ~600 kg; we scale ~1/8 to ~70 kg for a stable sim
+           timestep while keeping the chassis-to-wheel mass ratio realistic (~50:1).
+           The CoM is offset DOWN (-0.18 = chassis bottom, where the RTG / battery
+           sit on a real rover) to lower the effective tipping lever arm during
+           cornering — without this the rover lifts wheels under in-place spin. -->
+      <inertial pos="0 0 -0.18" mass="70" diaginertia="22 8 28"/>
+      <!-- Chase camera: follows the rover from behind. Rover forward is +Y, so
+           "behind" is -Y. targetbody mode auto-orients the camera to look at the
+           base_link COM. Selectable in the viewer by camera name "chase". -->
+      <camera name="chase" pos="0 -4.5 2.0" mode="targetbody" target="base_link" fovy="55"/>
+      <geom name="chassis" class="chassis" type="box" size="0.55 0.95 0.18"/>
+      <geom name="back_box" class="chassis" type="box" size="0.45 0.25 0.25" pos="0 -0.8 0.25"/>
+      <geom name="mast" class="arm" type="cylinder" size="0.04 0.4" pos="0.0 0.55 0.45"/>
+      <geom name="mast_head" class="arm" type="box" size="0.12 0.06 0.06" pos="0.0 0.55 0.85"/>
+
+      <!-- Mast-mounted navigation camera, looks forward (rover forward = +Y).
+           Camera convention: image plane is XY of camera frame; camera looks down -Z.
+           xyaxes specifies camera X (right of image) and Y (up); Z = X × Y.
+           We need cam -Z = +Y world, so cam Z = -Y, which gives xyaxes that make X×Y=(0,-1,0). -->
+      <camera name="navcam" pos="0 0.62 0.95" xyaxes="1 0 0  0 0 1" fovy="70"/>
+
+      <!-- Lidar: 5-ray fan on the chassis front edge, ±60° around rover forward (+Y).
+           Sited at y=0.95 (chassis front face), z=0.30 (above chassis top) so the ray
+           origin is clear of all rover geometry. Each site is oriented so its +Z (the
+           rangefinder cast direction) points forward in the horizontal plane. -->
+      <site name="lidar_ray_m60" pos="0 0.95 0.30" xyaxes="-0.5 -0.866 0  0 0 1"/>
+      <site name="lidar_ray_m30" pos="0 0.95 0.30" xyaxes="-0.866 -0.5 0  0 0 1"/>
+      <site name="lidar_ray_0"   pos="0 0.95 0.30" xyaxes="-1 0 0  0 0 1"/>
+      <site name="lidar_ray_p30" pos="0 0.95 0.30" xyaxes="-0.866 0.5 0  0 0 1"/>
+      <site name="lidar_ray_p60" pos="0 0.95 0.30" xyaxes="-0.5 0.866 0  0 0 1"/>
+
+      <!-- Arm: 4 DoF (yaw / shoulder / elbow / wrist), position-controlled.
+           Mounted at the center of the chassis FRONT FACE (+Y face) like real
+           Curiosity/Perseverance. At default ctrl=0 the arm extends straight
+           forward (+Y); shoulder positive lifts up, elbow positive folds in. -->
+      <body name="arm_base" pos="0 0.95 -0.05">
+        <joint name="arm_yaw" axis="0 0 1" range="-1.57 1.57" damping="15"/>
+        <geom class="arm" type="cylinder" size="0.06 0.05"/>
+        <body name="arm_1" pos="0 0.06 0">
+          <joint name="arm_shoulder" axis="1 0 0" range="-1.5 1.5" damping="15"/>
+          <geom class="arm" type="capsule" fromto="0 0 0 0 0.50 0" size="0.04"/>
+          <body name="arm_2" pos="0 0.50 0">
+            <joint name="arm_elbow" axis="1 0 0" range="-2.5 2.5" damping="12"/>
+            <geom class="arm" type="capsule" fromto="0 0 0 0 0.40 0" size="0.035"/>
+            <body name="arm_tool" pos="0 0.40 0">
+              <joint name="arm_wrist" axis="0 1 0" range="-2.5 2.5" damping="8"/>
+              <geom class="arm" type="box" size="0.06 0.06 0.04"/>
+              <site name="tool_tip" pos="0 0.06 0"/>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- Right rocker. Pivots at the chassis side. The arms extend OUTBOARD and
+           slightly DOWN to the steering knuckles, which sit ABOVE the wheel tops.
+           A vertical strut drops from each knuckle through the wheel hub down to
+           the axle (the strut visually traverses the wheel silhouette like a real
+           rover's steering housing). The steering Z axis passes through the wheel
+           center → zero scrub radius. The middle wheels have no steering joint;
+           they hang from a rigid vertical stub on the bogie. Suspension geoms use
+           contype=0 so the rigid skeleton links don't self-collide. -->
+      <body name="rocker_right" pos="0.65 0.10 0.10">
+        <!-- Rocker pivot. PASSIVE per real Curiosity / Perseverance — no springs,
+             no controllers, only low bearing friction (damping≈2). The articulation
+             range is the mechanical hard-stop range (±25°). The two rockers are
+             coupled by the differential equality below the worldbody. -->
+        <joint name="rocker_right_joint" axis="1 0 0" range="-0.44 0.44"
+               damping="2" stiffness="0"/>
+        <!-- Front arm: extends outboard (+x, +0.16) and forward (+y, +0.55) with
+             a slight downward bend (-0.05) so the arm tip sits just above wheel top. -->
+        <geom class="rocker" type="cylinder" fromto="0 0 0  0.16 0.55 -0.35" size="0.04"
+              contype="0" conaffinity="0"/>
+        <!-- Rear arm to bogie pivot: outboard + back, also slight down bend. -->
+        <geom class="rocker" type="cylinder" fromto="0 0 0  0.16 -0.50 -0.15" size="0.04"
+              contype="0" conaffinity="0"/>
+
+        <body name="steer_right_front" pos="0.16 0.55 -0.35">
+          <joint name="steer_right_front_joint" axis="0 0 1" range="-1.0 1.0"
+                 damping="20" stiffness="0"/>
+          <!-- Vertical steering strut from knuckle (above wheel top) down to axle. -->
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
+                contype="0" conaffinity="0"/>
+          <body name="wheel_right_front" pos="0 0 -0.25">
+            <joint name="wheel_right_front_joint" axis="1 0 0"/>
+            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+          </body>
+        </body>
+
+        <body name="bogie_right" pos="0.16 -0.50 -0.15">
+          <joint name="bogie_right_joint" axis="1 0 0" range="-0.35 0.35"
+                 damping="8" stiffness="0"/>
+          <!-- Λ-shaped bogie: pivot at top, arms drop down-forward and down-back.
+               The middle-wheel strut is a geom of the bogie (NOT the wheel) so it
+               stays still while the wheel rolls. -->
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0 0.35 -0.20" size="0.035"
+                contype="0" conaffinity="0"/>
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0 -0.35 -0.20" size="0.035"
+                contype="0" conaffinity="0"/>
+          <geom class="rocker" type="cylinder" fromto="0 0.35 -0.20 0 0.35 -0.45" size="0.035"
+                contype="0" conaffinity="0"/>
+
+          <body name="wheel_right_middle" pos="0 0.35 -0.45">
+            <joint name="wheel_right_middle_joint" axis="1 0 0"/>
+            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+          </body>
+
+          <body name="steer_right_rear" pos="0 -0.35 -0.20">
+            <joint name="steer_right_rear_joint" axis="0 0 1" range="-1.0 1.0"
+                   damping="20" stiffness="0"/>
+            <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
+                  contype="0" conaffinity="0"/>
+            <body name="wheel_right_rear" pos="0 0 -0.25">
+              <joint name="wheel_right_rear_joint" axis="1 0 0"/>
+              <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
+              <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- Left rocker (mirror of right; arms go -X outboard). -->
+      <body name="rocker_left" pos="-0.65 0.10 0.10">
+        <joint name="rocker_left_joint" axis="1 0 0" range="-0.44 0.44"
+               damping="2" stiffness="0"/>
+        <geom class="rocker" type="cylinder" fromto="0 0 0  -0.16 0.55 -0.35" size="0.04"
+              contype="0" conaffinity="0"/>
+        <geom class="rocker" type="cylinder" fromto="0 0 0  -0.16 -0.50 -0.15" size="0.04"
+              contype="0" conaffinity="0"/>
+
+        <body name="steer_left_front" pos="-0.16 0.55 -0.35">
+          <joint name="steer_left_front_joint" axis="0 0 1" range="-1.0 1.0"
+                 damping="20" stiffness="0"/>
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
+                contype="0" conaffinity="0"/>
+          <body name="wheel_left_front" pos="0 0 -0.25">
+            <joint name="wheel_left_front_joint" axis="1 0 0"/>
+            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+          </body>
+        </body>
+
+        <body name="bogie_left" pos="-0.16 -0.50 -0.15">
+          <joint name="bogie_left_joint" axis="1 0 0" range="-0.35 0.35"
+                 damping="8" stiffness="0"/>
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0 0.35 -0.20" size="0.035"
+                contype="0" conaffinity="0"/>
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0 -0.35 -0.20" size="0.035"
+                contype="0" conaffinity="0"/>
+          <geom class="rocker" type="cylinder" fromto="0 0.35 -0.20 0 0.35 -0.45" size="0.035"
+                contype="0" conaffinity="0"/>
+
+          <body name="wheel_left_middle" pos="0 0.35 -0.45">
+            <joint name="wheel_left_middle_joint" axis="1 0 0"/>
+            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+          </body>
+
+          <body name="steer_left_rear" pos="0 -0.35 -0.20">
+            <joint name="steer_left_rear_joint" axis="0 0 1" range="-1.0 1.0"
+                   damping="20" stiffness="0"/>
+            <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
+                  contype="0" conaffinity="0"/>
+            <body name="wheel_left_rear" pos="0 0 -0.25">
+              <joint name="wheel_left_rear_joint" axis="1 0 0"/>
+              <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
+              <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <equality>
+    <!-- Rocker-bogie differential: the two rockers are mechanically coupled so they
+         counter-rotate (left rocker up <=> right rocker down). On the real rover this
+         is a transverse differential bar (Sojourner) or a differential gearbox
+         (Curiosity / Perseverance) mounted on the chassis. We model it as a joint
+         equality `rocker_right = -rocker_left`, which is the exact kinematic
+         relationship the physical mechanism enforces; no extra bodies needed.
+         Effect: chassis pitch becomes the average of the two rocker pitches, so
+         single-wheel bumps lift the chassis by half the obstacle height instead of
+         the full height. -->
+    <joint name="rocker_diff" joint1="rocker_right_joint" joint2="rocker_left_joint"
+           polycoef="0 -1 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001"/>
+  </equality>
+
+  <actuator>
+    <!-- Drive (velocity-controlled): 6 wheels. ctrl indices 0..5. -->
+    <general  class="drive" name="drive_right_front"  joint="wheel_right_front_joint"/>
+    <general  class="drive" name="drive_right_middle" joint="wheel_right_middle_joint"/>
+    <general  class="drive" name="drive_right_rear"   joint="wheel_right_rear_joint"/>
+    <general  class="drive" name="drive_left_front"   joint="wheel_left_front_joint"/>
+    <general  class="drive" name="drive_left_middle"  joint="wheel_left_middle_joint"/>
+    <general  class="drive" name="drive_left_rear"    joint="wheel_left_rear_joint"/>
+    <!-- Steering (position-controlled): 4 corner wheels, middle wheels are fixed.
+         ctrl indices 6..9 (default 0 = wheel pointing forward). -->
+    <position class="steer" name="steer_right_front"  joint="steer_right_front_joint"/>
+    <position class="steer" name="steer_right_rear"   joint="steer_right_rear_joint"/>
+    <position class="steer" name="steer_left_front"   joint="steer_left_front_joint"/>
+    <position class="steer" name="steer_left_rear"    joint="steer_left_rear_joint"/>
+    <!-- Arm (position-controlled): yaw / shoulder / elbow / wrist.
+         ctrl indices 10..13 (default 0 = stowed straight-up pose). -->
+    <position class="armjoint" name="arm_yaw"      joint="arm_yaw"      ctrlrange="-1.57 1.57"/>
+    <position class="armjoint" name="arm_shoulder" joint="arm_shoulder" ctrlrange="-1.57 1.57"/>
+    <position class="armjoint" name="arm_elbow"    joint="arm_elbow"    ctrlrange="-2.5 2.5"/>
+    <position class="armjoint" name="arm_wrist"    joint="arm_wrist"    ctrlrange="-1.57 1.57"/>
+  </actuator>
+
+  <sensor>
+    <!-- IMU + body pose -->
+    <gyro          name="imu_gyro"   site="imu"/>
+    <accelerometer name="imu_accel"  site="imu"/>
+    <framepos      name="base_pos"   objtype="site" objname="imu"/>
+    <framequat     name="base_quat"  objtype="site" objname="imu"/>
+    <framelinvel   name="base_linvel" objtype="site" objname="imu"/>
+    <frameangvel   name="base_angvel" objtype="site" objname="imu"/>
+    <!-- 5-ray forward lidar fan (return ray distance, or -1 if no hit). -->
+    <rangefinder name="lidar_m60" site="lidar_ray_m60"/>
+    <rangefinder name="lidar_m30" site="lidar_ray_m30"/>
+    <rangefinder name="lidar_0"   site="lidar_ray_0"/>
+    <rangefinder name="lidar_p30" site="lidar_ray_p30"/>
+    <rangefinder name="lidar_p60" site="lidar_ray_p60"/>
+    <!-- Arm tool tip pose for end-effector tracking. -->
+    <framepos    name="tool_pos"  objtype="site" objname="tool_tip"/>
+  </sensor>
+</mujoco>

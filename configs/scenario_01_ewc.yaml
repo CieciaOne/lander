@@ -1,0 +1,9 @@
+scenario: scenario_01_sequential_terrains
+cl_method: ewc
+seed: 0
+scenario_kwargs:
+  train_timesteps: 100000
+  eval_episodes: 10
+  max_steps: 1000
+cl_kwargs:
+  lam: 1000.0

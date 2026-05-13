@@ -1,0 +1,36 @@
+[project]
+name = "rover-cl"
+version = "0.1.0"
+description = "Continual learning framework for Mars rover navigation in MuJoCo."
+authors = [{ name = "Jakub Ciećka", email = "CieciaV2.0@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "gymnasium[mujoco]>=0.29.0",
+    "numpy>=1.24.0",
+    "stable-baselines3>=2.0.0",
+    "torch>=2.0.0",
+    "mujoco>=3.5.0,<4.0.0",
+    "matplotlib>=3.10.0,<4.0.0",
+    "pyyaml>=6.0",
+    "opensimplex>=0.4.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[tool.poetry]
+packages = [{ include = "rover_cl", from = "src" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
+markers = [
+    "fast: unit tests with no physics; should run in <100ms each",
+    "sim: tests that load a MuJoCo model or step physics (no RL training)",
+    "slow: tests that run a tiny end-to-end mission (involves SB3 PPO training)",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

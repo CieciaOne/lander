@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Project-specific
+# Training outputs (checkpoints, plots, JSONs) — too big and reproducible.
+results/
+
+# Source-asset originals (URDFs, blender files, meshes from the original
+# rover model) — NOT loaded at runtime. assets/rover.xml is the active MJCF
+# and IS committed.
+data/
+
+# Unused rover assets — kept on disk for reference but the project doesn't
+# load them at runtime.
+assets/meshes/
+assets/rover_chassis.urdf
+
+# Duplicate of docs/plan.md — the canonical copy lives under docs/.
+/plan.md
+
+# Tensorboard logs from PPO training (if you wire it up).
+runs/
+tb/

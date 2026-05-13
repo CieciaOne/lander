@@ -1,0 +1,8 @@
+scenario: scenario_07_blocked_arc
+cl_method: naive
+seed: 0
+scenario_kwargs:
+  train_timesteps: 200000
+  eval_episodes: 10
+  max_steps: 1500
+cl_kwargs: {}
