@@ -287,6 +287,111 @@ def plot_retention_curves(
     return fig
 
 
+def plot_skill_survival(
+    results: dict[str, Any],
+    task_ids: list[str],
+    out: Path,
+) -> Figure:
+    """Single chart that tells the WHOLE per-task forgetting + recovery story.
+
+    Layered over `plot_retention_curves`:
+      * Solid markers + thick line = post-phase eval (the retention matrix
+        row, as in plot_retention_curves).
+      * Small open markers and a thin dashed line = INTERIM eval during the
+        phase where this task IS the training task. Shows mid-phase learning
+        curve. Only present when the phase has `interim_eval` in
+        results.json (scenarios that opt in via `task.interim_eval_every` or
+        the adaptive gate).
+
+    No-ops on results.json files from scenarios that don't emit interim eval
+    — falls back to the same shape as plot_retention_curves.
+    """
+    retention = compute_retention_matrix(results)
+    n_rows, n_cols = retention.shape
+    phases = np.arange(n_rows)
+
+    fig, ax = plt.subplots(figsize=(max(6.0, 1.0 * n_rows + 3.4), 4.6))
+
+    # Pull the per-phase `interim_eval` arrays out of the evaluations[] list.
+    # We index by phase so phase k holds the within-phase trajectory of
+    # task k (the task being trained in phase k).
+    phase_interim: dict[int, list[dict[str, float]]] = {}
+    for ev in results.get("evaluations", []):
+        ph = int(ev.get("phase", -1))
+        timings = ev.get("timings") or {}
+        entries = timings.get("interim_eval") or []
+        if entries:
+            phase_interim[ph] = entries
+
+    for j in range(n_cols):
+        col = retention[:, j]
+        valid = ~np.isnan(col)
+        if not valid.any():
+            continue
+        color = _THESIS_COLORS[j % len(_THESIS_COLORS)]
+
+        # Main retention line (same look as plot_retention_curves).
+        ax.plot(phases[valid], col[valid], color=color, linewidth=4.0,
+                alpha=0.12, solid_capstyle="round")
+        ax.plot(phases[valid], col[valid], color=color, linewidth=2.0,
+                marker="o", markersize=6.5, markeredgewidth=0.0,
+                label=task_ids[j], solid_capstyle="round")
+
+        # Interim eval overlay — only valid for SELF (j == phase). Project
+        # the within-phase trajectory onto x ∈ [j-1, j] (the "leading up to
+        # post-phase eval" range), with the final interim point coinciding
+        # with the post-phase value.
+        if j in phase_interim:
+            traj = phase_interim[j]
+            if traj:
+                steps = np.array([t["steps_trained_in_phase"] for t in traj], dtype=float)
+                vals = np.array([t["success_rate"] for t in traj], dtype=float)
+                # Normalise step axis to [0, 1] inside the phase, then map
+                # to [j - 0.9, j] so it lives just to the left of the post-
+                # phase marker.
+                if steps.max() > 0:
+                    xs = (j - 0.9) + 0.9 * (steps / steps.max())
+                else:
+                    xs = np.full_like(steps, j - 0.9)
+                ax.plot(xs, vals, color=color, linewidth=1.0, linestyle="--",
+                        alpha=0.55)
+                ax.plot(xs, vals, color=color, linewidth=0.0,
+                        marker="o", markersize=3.5,
+                        markerfacecolor="none", markeredgewidth=0.9,
+                        alpha=0.7)
+
+        # Annotate final value as in plot_retention_curves.
+        last_phase = phases[valid].max()
+        last_val = col[valid][-1]
+        ax.annotate(
+            f"{last_val:.2f}",
+            xy=(last_phase, last_val),
+            xytext=(6, 0), textcoords="offset points",
+            color=color, fontsize=8.5, family="sans-serif", va="center",
+        )
+
+    ax.set_xticks(phases)
+    ax.set_xticklabels([f"after {task_ids[k]}" for k in range(n_rows)],
+                       rotation=15, ha="right")
+    ax.set_ylim(-0.04, 1.08)
+    ax.set_xlim(-0.5, n_rows - 0.55)
+    ax.set_xlabel("Training phase", color=_FG_MUTED)
+    ax.set_ylabel("success rate", color=_FG_MUTED)
+    method = results.get("cl_method", "")
+    mission = results.get("mission_name", "")
+    title_bits = [b for b in [mission, method] if b]
+    title = "Skill survival per task" + (
+        f"  ·  {' | '.join(title_bits)}" if title_bits else ""
+    )
+    ax.set_title(title, color=_FG, loc="left")
+    ax.legend(title="task", loc="lower left", title_fontsize=8.5,
+              fontsize=8.5, frameon=False)
+
+    fig.tight_layout()
+    _save(fig, out)
+    return fig
+
+
 def plot_method_comparison_with_variance(
     results_by_method: dict[str, list[dict[str, Any]]],
     task_ids: list[str],

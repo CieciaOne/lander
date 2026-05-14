@@ -48,6 +48,7 @@ from rover_cl.missions import Mission, Runner, get_scenario  # noqa: E402
 from rover_cl.viz import (  # noqa: E402
     plot_method_comparison_with_variance,
     plot_retention_curves,
+    plot_skill_survival,
     plot_retention_matrix,
 )
 
@@ -81,6 +82,7 @@ def run_mission(mission: Mission, results_dir: Path, n_envs: int = 1,
         out=out_dir / "retention_matrix.png",
     )
     plot_retention_curves(results, task_ids, out=out_dir / "retention_curves.png")
+    plot_skill_survival(results, task_ids, out=out_dir / "skill_survival.png")
 
     print(f"\n=== Summary ({mission.cl_method}, seed {mission.seed}) ===")
     print(f"  avg retention: {compute_avg_retention(retention):.3f}")

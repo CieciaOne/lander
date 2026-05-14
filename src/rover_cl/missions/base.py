@@ -80,6 +80,25 @@ class Task:
     # start" local minimum, which higher entropy helps escape. None means
     # "leave the default from PPO kwargs alone".
     ent_coef: float | None = None
+    # Adaptive-advance gate. When `min_success_to_advance` is set, the
+    # Runner keeps training the phase in `gate_check_interval`-step chunks
+    # until either eval success on the current phase task crosses the
+    # threshold OR the cumulative trained steps hit `train_timesteps *
+    # max_budget_multiplier`. Off by default so existing scenarios are
+    # unaffected; opt-in per-task. Used by scenario_11_robust_generalist.
+    min_success_to_advance: float | None = None
+    max_budget_multiplier: float = 2.0
+    gate_check_interval: int = 50_000
+    gate_eval_episodes: int = 8
+    # Interim eval cadence. When > 0, the Runner runs `interim_eval_episodes`
+    # rollouts on the current phase task every `interim_eval_every` env
+    # steps and stashes the per-checkpoint success rate in results.json
+    # under `interim_eval`. 0 disables. Independent from the adaptive gate
+    # (you can run interim eval without gating, or gate without separate
+    # interim eval — though the gate produces interim eval as a side
+    # effect).
+    interim_eval_every: int = 0
+    interim_eval_episodes: int = 5
 
 
 @dataclass
@@ -255,19 +274,119 @@ class Runner:
                 train_env = task.env_factory(self.mission.seed + phase)
 
             # --- training ----------------------------------------------------
+            # Two opt-in features piggyback on this loop:
+            #   * Interim eval. If `task.interim_eval_every > 0`, every N env
+            #     steps we run a quick eval on this phase's own task and
+            #     record (steps_trained, success_rate) into the results.json's
+            #     `interim_eval` field. Lets us see mid-phase learning curves
+            #     without waiting for the post-phase eval.
+            #   * Adaptive gate. If `task.min_success_to_advance` is set, we
+            #     train in `gate_check_interval`-step chunks and stop early
+            #     once eval success crosses the threshold (saving budget on
+            #     easy phases), or train up to `train_timesteps *
+            #     max_budget_multiplier` (saving the harder ones).
+            #
+            # When neither feature is enabled (the default for all existing
+            # scenarios), we fall through to a single `cl.train_on` call —
+            # identical to the previous behaviour.
             episode_counter = EpisodeCounter()
             train_start = time.perf_counter()
             if task.ent_coef is not None:
                 self._log(f"  ent_coef override: {task.ent_coef:.4f} for this phase")
-            cl.train_on(
-                env=train_env,
-                total_timesteps=task.train_timesteps,
-                task_id=task.task_id,
-                log_dir=tb_dir,
-                skip_post_train=using_vec,
-                callback=episode_counter,
-                ent_coef=task.ent_coef,
-            )
+
+            interim_history: list[dict[str, float]] = []
+
+            use_chunked = (task.interim_eval_every > 0
+                           or task.min_success_to_advance is not None)
+            if not use_chunked:
+                cl.train_on(
+                    env=train_env,
+                    total_timesteps=task.train_timesteps,
+                    task_id=task.task_id,
+                    log_dir=tb_dir,
+                    skip_post_train=using_vec,
+                    callback=episode_counter,
+                    ent_coef=task.ent_coef,
+                )
+            else:
+                base = task.train_timesteps
+                max_total = int(base * task.max_budget_multiplier)
+                if task.min_success_to_advance is not None:
+                    chunk = int(task.gate_check_interval)
+                elif task.interim_eval_every > 0:
+                    chunk = int(task.interim_eval_every)
+                else:
+                    chunk = base
+                trained = 0
+                last_interim_at = 0
+                # Train in `chunk` increments; check both stopping conditions
+                # after each. The chunk is the LCM between the two cadences
+                # in spirit (we use the smaller of the two so neither feature
+                # misses a checkpoint).
+                while trained < max_total:
+                    this_chunk = min(chunk, max_total - trained)
+                    cl.train_on(
+                        env=train_env,
+                        total_timesteps=this_chunk,
+                        task_id=task.task_id,
+                        log_dir=tb_dir,
+                        skip_post_train=True,   # we'll do post-train once at end
+                        callback=episode_counter,
+                        ent_coef=task.ent_coef,
+                    )
+                    trained += this_chunk
+
+                    # Interim eval (independent of the gate).
+                    do_interim = (
+                        task.interim_eval_every > 0
+                        and trained - last_interim_at >= task.interim_eval_every
+                    )
+                    if do_interim or task.min_success_to_advance is not None:
+                        # Run a small eval on this phase's task. Re-use the
+                        # env_factory (single-env) so the gate-check is cheap
+                        # and doesn't touch the SubprocVecEnv / MjxVecEnv that
+                        # PPO is training on.
+                        gate_env = task.env_factory(self.mission.seed
+                                                    + phase * 1000
+                                                    + 7777 + trained)
+                        gate_n = (task.gate_eval_episodes
+                                  if task.min_success_to_advance is not None
+                                  else task.interim_eval_episodes)
+                        gate_stats, _ = evaluate_with_trajectories(
+                            policy_predict_fn=(lambda o: cl.predict(o, deterministic=True)[0]),
+                            env=gate_env,
+                            n_episodes=gate_n,
+                            max_steps=task.eval_max_steps,
+                            seed_base=trained,
+                        )
+                        try:
+                            gate_env.close()
+                        except Exception:
+                            pass
+                        interim_history.append({
+                            "steps_trained_in_phase": int(trained),
+                            "success_rate": float(gate_stats.success_rate),
+                            "mean_return": float(gate_stats.mean_return),
+                            "n_episodes": int(gate_n),
+                        })
+                        last_interim_at = trained
+                        self._log(
+                            f"  [interim @ {trained:,}/{max_total:,}] "
+                            f"success_rate={gate_stats.success_rate:.2f} "
+                            f"mean_return={gate_stats.mean_return:+.2f}"
+                        )
+                        # Gate check.
+                        if (task.min_success_to_advance is not None
+                                and gate_stats.success_rate >= task.min_success_to_advance
+                                and trained >= base):
+                            self._log(
+                                f"  gate satisfied ({gate_stats.success_rate:.2f} "
+                                f">= {task.min_success_to_advance:.2f}) — "
+                                f"advancing early at {trained:,} of "
+                                f"max {max_total:,} steps"
+                            )
+                            break
+
             train_seconds = time.perf_counter() - train_start
             n_train_episodes = episode_counter.n_episodes
             mean_ep_len = episode_counter.mean_episode_length
@@ -361,6 +480,11 @@ class Runner:
                 # without re-parsing logs.
                 "train_episodes": int(n_train_episodes),
                 "train_mean_episode_steps": round(mean_ep_len, 1),
+                # Interim-eval history (mid-phase checkpoints). Empty list
+                # when the phase ran in single-call mode without interim
+                # eval / adaptive gating. Each entry has steps_trained,
+                # success_rate, mean_return, n_episodes.
+                "interim_eval": interim_history,
             }
             evaluations.append(PhaseResult(
                 phase=phase, after_training=task.task_id,

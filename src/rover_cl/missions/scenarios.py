@@ -44,6 +44,12 @@ def _make_task(
     max_steps: int,
     *,
     ent_coef: float | None = None,
+    min_success_to_advance: float | None = None,
+    max_budget_multiplier: float = 2.0,
+    gate_check_interval: int = 50_000,
+    gate_eval_episodes: int = 8,
+    interim_eval_every: int = 0,
+    interim_eval_episodes: int = 5,
 ) -> Task:
     return Task(
         terrain_name,
@@ -52,6 +58,12 @@ def _make_task(
         eval_episodes=eval_episodes,
         eval_max_steps=max_steps,
         ent_coef=ent_coef,
+        min_success_to_advance=min_success_to_advance,
+        max_budget_multiplier=max_budget_multiplier,
+        gate_check_interval=gate_check_interval,
+        gate_eval_episodes=gate_eval_episodes,
+        interim_eval_every=interim_eval_every,
+        interim_eval_episodes=interim_eval_episodes,
     )
 
 
@@ -356,6 +368,100 @@ def scenario_10_robust_curriculum(
     )
 
 
+def scenario_11_robust_generalist(
+    cl_method: str = "ewc",
+    train_timesteps: int = 300_000,
+    eval_episodes: int = 12,
+    max_steps: int = 1500,
+    seed: int = 0,
+    ewc_lam: float = 400.0,
+    enable_gate: bool = True,
+    enable_interim_eval: bool = True,
+) -> Mission:
+    """Scenario 11: 7-phase MIXED-DISTRIBUTION curriculum for generalization.
+
+    Rebuilt from scenario_10's lessons. The single biggest change: every
+    phase samples internally across a sub-distribution that already covers
+    earlier phases as an anchor. The capstone (RC_full_random) is then a
+    uniform draw over the cross-product of those sub-distributions, so any
+    held-out evaluation is *in-distribution* by construction.
+
+    Phase progression:
+        0. RC_locomotion         — drive to a goal, 4-way bearing mix +
+                                   "stop" anchor. Foundation skill.
+        1. RC_path_following     — 0-5 waypoints in various configurations
+                                   (line, twisty, arc, slalom). Includes
+                                   25% no-waypoint anchor.
+        2. RC_obstacle_avoidance — 0/1-2/3-6/7-10 obstacles. 25% none.
+        3. RC_path_and_obstacles — composes 1+2. 20% waypoint-only and
+                                   40% obstacle-only anchors keep both
+                                   precursor skills alive.
+        4. RC_terrain            — heightmap-only at three elevations.
+                                   30% flat anchor.
+        5. RC_terrain_plus       — terrain + obstacles. 40% flat-with-
+                                   obstacles anchor + 20% terrain-only.
+        6. RC_full_random        — capstone uniform draw. Match what we
+                                   evaluate on.
+
+    Mechanisms beyond the curriculum itself:
+        * `min_success_to_advance` per phase (when `enable_gate=True`).
+          Each phase keeps training in 50k-step chunks until 8-episode
+          eval success crosses the threshold OR cumulative steps reach
+          `train_timesteps × max_budget_multiplier`. Means "easy phases
+          stop early, hard phases get more budget".
+        * Interim eval every 25k steps (when `enable_interim_eval=True`)
+          logged to `results.json::interim_eval`. Catches mid-phase
+          regressions without waiting for the post-phase eval.
+        * EWC λ=400. With the within-phase anchoring above, the CL
+          method has a much easier protection job — most of the work is
+          already done by the data distribution.
+
+    Default budget: 300k × phase multipliers ≈ 2.7 M base. With the gate,
+    well-converging phases may stop earlier; the worst case (every phase
+    hits its max budget) is 300k × ~22 = 6.6 M total env steps. With
+    `--n-envs 6` on M3 Air: 3-5 hours wall-clock per seed.
+    """
+    # (terrain, base_multiplier, ent_coef_override, advance_threshold)
+    # Advance thresholds: easier phases set 0.85, harder phases 0.65 — the
+    # gate gives easy phases an early stop while letting hard ones absorb
+    # the slack. The capstone has no threshold (no advance after it) so
+    # the gate falls back to max_budget for that phase.
+    phase_plan: list[tuple[str, float, float | None, float | None]] = [
+        ("RC_locomotion",          1.0, None,  0.90),
+        ("RC_path_following",      1.5, None,  0.80),
+        ("RC_obstacle_avoidance",  2.0, 0.03,  0.70),
+        ("RC_path_and_obstacles",  1.5, 0.03,  0.65),
+        ("RC_terrain",             1.5, None,  0.75),
+        ("RC_terrain_plus",        1.5, 0.02,  0.65),
+        ("RC_full_random",         2.0, 0.02,  None),
+    ]
+    cl_kwargs: dict = {"lam": ewc_lam} if cl_method == "ewc" else {}
+
+    interim_every = 25_000 if enable_interim_eval else 0
+
+    tasks = []
+    for terrain, mult, ec, threshold in phase_plan:
+        tasks.append(_make_task(
+            terrain,
+            int(train_timesteps * mult),
+            eval_episodes, max_steps,
+            ent_coef=ec,
+            min_success_to_advance=threshold if enable_gate else None,
+            max_budget_multiplier=2.0,
+            gate_check_interval=50_000,
+            gate_eval_episodes=8,
+            interim_eval_every=interim_every,
+            interim_eval_episodes=5,
+        ))
+    return Mission(
+        name=f"scenario_11_robust_generalist_{cl_method}",
+        tasks=tasks,
+        cl_method=cl_method,
+        cl_kwargs=cl_kwargs,
+        seed=seed,
+    )
+
+
 def scenario_02_threat_classes(**_kwargs) -> Mission:
     """Scenario 2 (threat classification track) — NOT YET IMPLEMENTED.
 
@@ -393,6 +499,7 @@ SCENARIO_REGISTRY = {
     "scenario_08_blocked_arc_hills": scenario_08_blocked_arc_hills,
     "scenario_09_curriculum_arc": scenario_09_curriculum_arc,
     "scenario_10_robust_curriculum": scenario_10_robust_curriculum,
+    "scenario_11_robust_generalist": scenario_11_robust_generalist,
     # Stubs (raise NotImplementedError on call but registered so they're discoverable):
     "scenario_02_threat_classes": scenario_02_threat_classes,
     "scenario_06_fusion": scenario_06_fusion,

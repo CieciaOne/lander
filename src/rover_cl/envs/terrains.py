@@ -1031,6 +1031,427 @@ def terrain_RT_mixed(seed: int = 0) -> TerrainSpec:
     return spec
 
 
+# ---------------------------------------------------------------------------
+# scenario_11 robust-generalist curriculum (RC_*) — mixed-distribution phases.
+#
+# Each terrain below SAMPLES INTERNALLY over a non-trivial sub-distribution,
+# rather than fixing one specific manoeuvre per phase. Two goals:
+#   1) Anchor sub-distribution per phase: every phase keeps a fraction of
+#      its earlier "trivial" case alive (e.g. RC_obstacle_avoidance has 25%
+#      zero-obstacle episodes). Within-phase mixing is much stronger
+#      protection against catastrophic forgetting than EWC alone.
+#   2) Hard composition is *built up* from already-trained sub-pieces, not
+#      introduced as a new task. The capstone RC_full_random is a uniform
+#      draw over the cross-product of all prior axes; held-out evaluation
+#      samples from the same distribution, so generalisation is just
+#      "sample-the-same-way at test time".
+# ---------------------------------------------------------------------------
+
+
+def terrain_RC_locomotion(seed: int = 0) -> TerrainSpec:
+    """Phase 0: drive to a single goal. No waypoints, no obstacles. Flat.
+
+    Within-phase mix on goal bearing relative to the rover's starting yaw:
+        50% front cone (0–45°)            — easy "go straight"
+        25% side cone (60–110°)           — turn-from-rest, single direction
+        15% behind cone (135–180°)        — U-turn-from-rest
+        10% short-hop (target < 2 m away) — teaches "stop", anchors success
+                                             on the trivial case so the
+                                             policy doesn't conflate goal
+                                             reaching with extended driving.
+
+    Distance: 5–12 m for the 90% non-short-hop slice. The short-hop slice
+    deliberately violates the usual `min_separation` so the policy sees
+    "you're already there" inputs.
+    """
+    spec = _flat_template("RC_locomotion", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        r = rng.uniform()
+        if r < 0.50:
+            bearing = "front"
+            min_sep = 5.0
+        elif r < 0.75:
+            bearing = "side"
+            min_sep = 5.0
+        elif r < 0.90:
+            bearing = "behind"
+            min_sep = 5.0
+        else:
+            # Short-hop "stop here" case: 1–2 m away.
+            bearing = "uniform"
+            min_sep = 1.0
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=min_sep, margin=2.0,
+            relative_bearing=bearing,
+        )
+        # For the short-hop case, override goal to be 1–2 m from start in
+        # whatever direction the sampler picked.
+        if min_sep == 1.0:
+            d = float(rng.uniform(1.0, 2.0))
+            ang = float(rng.uniform(0, 2 * np.pi))
+            gx = float(np.clip(start[0] + d * np.cos(ang), -10.0, 10.0))
+            gy = float(np.clip(start[1] + d * np.sin(ang), -10.0, 10.0))
+            goal = (gx, gy)
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal,
+            waypoints=(),
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_path_following(seed: int = 0) -> TerrainSpec:
+    """Phase 1: waypoint chains of variable length and shape. Flat, no obstacles.
+
+    Within-phase mix on chain configuration:
+        25% 0 waypoints                    — anchor: keeps phase-0 alive
+        25% 1 waypoint on-line (jitter ≤ 0.8 m)
+        20% 2–3 twisty waypoints (alternating sides, swing 1.5–3.0 m)
+        15% 2 waypoints on an arc (sweep 30°–90°, sign random)
+        15% 4–5 slalom waypoints (swing 1.5–3.0 m)
+
+    Mixed with 15% manoeuvre starts (side/behind cones) so the policy can't
+    just learn "always start moving forward".
+    """
+    spec = _flat_template("RC_path_following", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        # Start orientation: 85% forward, 15% manoeuvre.
+        bearing = "uniform" if rng.uniform() < 0.85 else "maneuver"
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
+            relative_bearing=bearing,
+        )
+        r = rng.uniform()
+        if r < 0.25:
+            wps = ()
+        elif r < 0.50:
+            wps = sample_waypoints_between(
+                rng, start, goal, n_waypoints=1, lateral_jitter=0.8,
+            )
+        elif r < 0.70:
+            n_wp = int(rng.integers(2, 4))
+            wps = sample_twisty_waypoints(
+                rng, start, goal, n_waypoints=n_wp,
+                arena_half=12.0, margin=2.0,
+                swing_min=1.5, swing_max=3.0,
+                alternate_sides=True,
+            )
+        elif r < 0.85:
+            wps = sample_arc_waypoints(
+                rng, start, goal, n_waypoints=2,
+                arc_angle_deg=(30.0, 90.0),
+            )
+        else:
+            n_wp = int(rng.integers(4, 6))
+            wps = sample_slalom_waypoints(
+                rng, start, goal, n_waypoints=n_wp,
+                swing_min=1.5, swing_max=3.0,
+            )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal,
+            waypoints=wps,
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
+    """Phase 2: obstacle dodging, density-mixed. Flat, no waypoints.
+
+    Within-phase mix on obstacle count:
+        25% 0 obstacles    — anchor: phase-0-equivalent stays alive
+        30% 1–2 obstacles  — easy avoidance
+        30% 3–6 obstacles  — moderate field
+        15% 7–10 obstacles — dense field
+
+    The 25% anchor slice is the headline change vs. scenario_10's obstacle
+    phases, which only got a 20% anchor and not all the way down to ZERO
+    obstacles for the densest phase.
+    """
+    spec = _flat_template("RC_obstacle_avoidance", max_obstacles=10,
+                          ground_rgba=(0.55, 0.40, 0.32, 1.0))
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        r = rng.uniform()
+        if r < 0.25:
+            n = 0
+            jitter = 1.0
+        elif r < 0.55:
+            n = int(rng.integers(1, 3))   # 1 or 2
+            jitter = 0.9
+        elif r < 0.85:
+            n = int(rng.integers(3, 7))   # 3..6
+            jitter = 1.5
+        else:
+            n = int(rng.integers(7, 11))  # 7..10
+            jitter = 2.2
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
+        )
+        pos, sz = sample_obstacles_along_path(
+            rng, start, goal,
+            n_obstacles=n, max_slots=10,
+            size_range=(0.4, 0.65),
+            lateral_jitter=jitter,
+        )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=(),
+            obstacle_positions=pos, obstacle_sizes=sz,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_path_and_obstacles(seed: int = 0) -> TerrainSpec:
+    """Phase 3: compose waypoints + obstacles. Flat.
+
+    Within-phase mix:
+        20% waypoints only       — phase-1 anchor
+        40% obstacles only       — phase-2 anchor
+        40% obstacles AND 1–2 waypoints — new skill (path-planning around objects)
+    """
+    spec = _flat_template("RC_path_and_obstacles", max_obstacles=8,
+                          ground_rgba=(0.58, 0.42, 0.30, 1.0))
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
+        )
+        r = rng.uniform()
+        if r < 0.20:
+            wps = sample_waypoints_between(
+                rng, start, goal, n_waypoints=int(rng.integers(1, 3)),
+                lateral_jitter=1.0,
+            )
+            pos, sz = [], []
+        elif r < 0.60:
+            wps = ()
+            n = int(rng.integers(3, 7))
+            pos, sz = sample_obstacles_along_path(
+                rng, start, goal,
+                n_obstacles=n, max_slots=8,
+                size_range=(0.4, 0.65), lateral_jitter=1.6,
+            )
+        else:
+            n_wp = int(rng.integers(1, 3))
+            wps = sample_twisty_waypoints(
+                rng, start, goal, n_waypoints=n_wp,
+                arena_half=12.0, margin=2.0,
+                swing_min=1.2, swing_max=2.5, alternate_sides=True,
+            )
+            n_obs = int(rng.integers(2, 6))
+            pos, sz = sample_obstacles_along_path(
+                rng, start, goal,
+                n_obstacles=n_obs, max_slots=8,
+                size_range=(0.4, 0.65), lateral_jitter=1.4,
+            )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
+            obstacle_positions=pos, obstacle_sizes=sz,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_terrain(seed: int = 0) -> TerrainSpec:
+    """Phase 4: drive over height. No obstacles, no waypoints.
+
+    Within-phase mix on terrain elevation (heightmap scales linearly with
+    `elevation_z` because the field itself is in [0, 1] — we control roughness
+    by re-rolling the heightmap, and amplitude by SCALING in the roll):
+        30% essentially flat (heightmap rolled but pre-scaled by 0.02)
+        40% gentle hills (peak ≤ 0.2 m)
+        30% bigger dunes (peak ≤ 0.5 m)
+
+    Note: the compiled spec must declare ONE elevation_z (the maximum the
+    hfield can address), so we set it to 0.5 m here and rescale the rolled
+    heightmap to use 4%, 40%, or 100% of the available range per episode.
+    """
+    spec = _hfield_template(
+        "RC_terrain", max_obstacles=0,
+        elevation_z=0.5, hm_seed=seed,
+        ground_rgba=(0.66, 0.48, 0.36, 1.0),
+    )
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=11.0, min_separation=6.0, margin=2.5,
+        )
+        hm = generate_heightmap_perlin(
+            nrow=48, ncol=48, scale=0.10, octaves=3,
+            seed=int(rng.integers(0, 10_000_000)),
+        )
+        r = rng.uniform()
+        if r < 0.30:
+            hm = hm * 0.04           # nearly flat
+        elif r < 0.70:
+            hm = hm * 0.40           # gentle hills
+        # else: full 100% of elevation_z=0.5 m → big dunes
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=(),
+            obstacle_positions=[], obstacle_sizes=[],
+            heightmap=hm,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_terrain_plus(seed: int = 0) -> TerrainSpec:
+    """Phase 5: terrain + obstacles. No waypoints.
+
+    Within-phase mix:
+        40% flat ground + 3–6 obstacles    — phase-2 anchor
+        40% hfield (0.2 m) + 2–4 obstacles — composed
+        20% hfield (0.3 m) only            — phase-4 anchor
+
+    Obstacles sit on the local terrain surface (sample_obstacles_along_path
+    queries the heightmap when one is provided).
+    """
+    spec = _hfield_template(
+        "RC_terrain_plus", max_obstacles=6,
+        elevation_z=0.4, hm_seed=seed,
+        ground_rgba=(0.62, 0.46, 0.34, 1.0),
+    )
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=11.0, min_separation=7.0, margin=2.5,
+        )
+        hm = generate_heightmap_perlin(
+            nrow=48, ncol=48, scale=0.10, octaves=3,
+            seed=int(rng.integers(0, 10_000_000)),
+        )
+        r = rng.uniform()
+        if r < 0.40:
+            hm = hm * 0.04           # essentially flat
+            n_obs = int(rng.integers(3, 7))
+        elif r < 0.80:
+            hm = hm * 0.50           # ~0.2 m peaks (50% of 0.4)
+            n_obs = int(rng.integers(2, 5))
+        else:
+            hm = hm * 0.75           # ~0.3 m peaks
+            n_obs = 0
+        if n_obs > 0:
+            pos, sz = sample_obstacles_along_path(
+                rng, start, goal,
+                n_obstacles=n_obs, max_slots=6,
+                size_range=(0.4, 0.65), lateral_jitter=1.6,
+                heightmap=hm, heightmap_extent=(11.0, 11.0, 0.4),
+            )
+        else:
+            pos, sz = [], []
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=(),
+            obstacle_positions=pos, obstacle_sizes=sz,
+            heightmap=hm,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_full_random(seed: int = 0) -> TerrainSpec:
+    """Phase 6 (capstone): uniform over (waypoints × obstacles × terrain).
+
+    By construction this is the distribution the deployed policy will be
+    evaluated on. The phase-6 train and the held-out eval draw from the
+    same generator with different seeds.
+
+    Per-roll:
+        n_waypoints  ~ {0: 0.30, 1: 0.20, 2: 0.20, 3: 0.15, 4: 0.10, 5: 0.05}
+        n_obstacles  ~ {0: 0.20, 1-2: 0.20, 3-5: 0.30, 6-8: 0.30}
+        hfield scale ~ {flat 0.02: 0.25, mild 0.30: 0.45, big 0.60: 0.30}
+        start type   ~ {uniform: 0.60, manoeuvre: 0.40}
+    """
+    spec = _hfield_template(
+        "RC_full_random", max_obstacles=8,
+        elevation_z=0.5, hm_seed=seed,
+        ground_rgba=(0.60, 0.45, 0.34, 1.0),
+    )
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        # start type
+        bearing = "maneuver" if rng.uniform() < 0.40 else "uniform"
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=11.0, min_separation=6.0, margin=2.5,
+            relative_bearing=bearing,
+        )
+
+        # waypoint count via the documented distribution.
+        r = rng.uniform()
+        cum = np.cumsum([0.30, 0.20, 0.20, 0.15, 0.10, 0.05])
+        n_wp = int(np.searchsorted(cum, r))  # 0..5
+        if n_wp == 0:
+            wps = ()
+        elif rng.uniform() < 0.5 and n_wp >= 2:
+            # arc / slalom mix
+            if rng.uniform() < 0.5:
+                wps = sample_arc_waypoints(
+                    rng, start, goal, n_waypoints=min(n_wp, 3),
+                    arc_angle_deg=(30.0, 90.0),
+                )
+            else:
+                wps = sample_slalom_waypoints(
+                    rng, start, goal, n_waypoints=n_wp,
+                    swing_min=1.4, swing_max=2.8,
+                )
+        else:
+            wps = sample_twisty_waypoints(
+                rng, start, goal, n_waypoints=n_wp,
+                arena_half=11.0, margin=2.5,
+                swing_min=1.4, swing_max=2.8, alternate_sides=True,
+            )
+
+        # obstacle count
+        r = rng.uniform()
+        if r < 0.20:
+            n_obs = 0
+        elif r < 0.40:
+            n_obs = int(rng.integers(1, 3))
+        elif r < 0.70:
+            n_obs = int(rng.integers(3, 6))
+        else:
+            n_obs = int(rng.integers(6, 9))
+
+        # terrain scale
+        r = rng.uniform()
+        hm = generate_heightmap_perlin(
+            nrow=48, ncol=48, scale=0.10, octaves=3,
+            seed=int(rng.integers(0, 10_000_000)),
+        )
+        if r < 0.25:
+            hm = hm * 0.04
+            terrain_z = 0.02
+        elif r < 0.70:
+            hm = hm * 0.60
+            terrain_z = 0.30
+        else:
+            hm = hm * 1.0
+            terrain_z = 0.50  # full elevation_z
+
+        if n_obs > 0:
+            pos, sz = sample_obstacles_along_path(
+                rng, start, goal,
+                n_obstacles=n_obs, max_slots=8,
+                size_range=(0.4, 0.65),
+                lateral_jitter=1.4 + 0.3 * (n_obs / 8.0),
+                heightmap=hm, heightmap_extent=(11.0, 11.0, 0.5),
+            )
+        else:
+            pos, sz = [], []
+
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
+            obstacle_positions=pos, obstacle_sizes=sz,
+            heightmap=hm,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
 TERRAIN_CATALOG: dict[str, TerrainFactory] = {
     "T1_flat": terrain_T1_flat,
     "T1_blocked_arc": terrain_T1_blocked_arc,
@@ -1053,6 +1474,14 @@ TERRAIN_CATALOG: dict[str, TerrainFactory] = {
     "RT_gentle_hills": terrain_RT_gentle_hills,
     "RT_dunes": terrain_RT_dunes,
     "RT_mixed": terrain_RT_mixed,
+    # scenario_11 robust-generalist curriculum (mixed-distribution phases):
+    "RC_locomotion":          terrain_RC_locomotion,
+    "RC_path_following":      terrain_RC_path_following,
+    "RC_obstacle_avoidance":  terrain_RC_obstacle_avoidance,
+    "RC_path_and_obstacles":  terrain_RC_path_and_obstacles,
+    "RC_terrain":             terrain_RC_terrain,
+    "RC_terrain_plus":        terrain_RC_terrain_plus,
+    "RC_full_random":         terrain_RC_full_random,
 }
 
 
