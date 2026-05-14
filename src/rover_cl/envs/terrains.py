@@ -22,6 +22,7 @@ from rover_cl.envs.randomization import (
     TerrainRoll,
     sample_obstacles_along_path,
     sample_start_goal_pair,
+    sample_twisty_waypoints,
     sample_waypoints_between,
 )
 
@@ -158,16 +159,38 @@ def compose_scene(terrain: TerrainSpec, include_rover: bool = True) -> str:
             ob.to_mjcf(f"obs_{i}") for i, ob in enumerate(terrain.obstacles)
         )
 
+    # Marker height: for flat-plane terrains a thin disk at ground level
+    # reads fine; for heightmap terrains the disk gets buried under any
+    # dune the marker happens to land on (e.g. RT_dunes goal sitting under
+    # a 0.4 m dune crest). Fix: render markers as TALL VERTICAL POSTS
+    # centred at z = (elevation_z + 0.4), spanning from below the dunes up
+    # to clearly above. Always visible regardless of where the marker lands.
+    if terrain.heightmap is not None:
+        ez = float(terrain.heightmap_extent[2])
+        marker_centre_z = ez + 0.6
+        marker_half_height = ez + 0.8     # post spans z ∈ [-0.2, 2*ez + 1.4]
+        marker_radius_scale = 0.18         # thin posts, not disks
+        wp_radius_scale = 0.14
+        wp_centre_z = ez + 0.5
+    else:
+        marker_centre_z = 0.02
+        marker_half_height = 0.02
+        marker_radius_scale = 1.0
+        wp_radius_scale = 1.0
+        wp_centre_z = 0.04
+
     waypoint_xml = "\n        ".join(
-        f'<site name="waypoint_{i}" pos="{wx} {wy} 0.04" '
-        f'size="{terrain.waypoint_radius} 0.04" type="cylinder" '
-        f'rgba="0.3 0.55 0.95 0.35"/>'
+        f'<site name="waypoint_{i}" pos="{wx} {wy} {wp_centre_z}" '
+        f'size="{terrain.waypoint_radius * wp_radius_scale} {marker_half_height}" '
+        f'type="cylinder" rgba="0.3 0.55 0.95 0.55"/>'
         for i, (wx, wy) in enumerate(terrain.waypoints)
     )
 
     g_rgba = terrain.ground_rgba
     sx, sy = terrain.start_pos
     gx, gy = terrain.goal_pos
+    start_radius = 0.4 * marker_radius_scale
+    goal_radius = terrain.goal_radius * marker_radius_scale
 
     hfield_asset_xml, ground_geom_xml = _ground_geom_xml(terrain)
 
@@ -198,11 +221,13 @@ def compose_scene(terrain: TerrainSpec, include_rover: bool = True) -> str:
     {ground_geom_xml}
     <light name="sun" pos="0 0 15" dir="0 0 -1" diffuse="0.6 0.6 0.6" castshadow="false"/>
 
-    <site name="start_marker" pos="{sx} {sy} 0.02" size="0.4 0.02" type="cylinder"
-          rgba="0.4 0.7 1.0 0.4"/>
+    <site name="start_marker" pos="{sx} {sy} {marker_centre_z}"
+          size="{start_radius} {marker_half_height}" type="cylinder"
+          rgba="0.4 0.7 1.0 0.55"/>
     {waypoint_xml}
-    <site name="goal_marker" pos="{gx} {gy} 0.05" size="{terrain.goal_radius} 0.05"
-          type="cylinder" rgba="0.2 0.9 0.2 0.5"/>
+    <site name="goal_marker" pos="{gx} {gy} {marker_centre_z}"
+          size="{goal_radius} {marker_half_height}"
+          type="cylinder" rgba="0.2 0.9 0.2 0.7"/>
 
     {obstacle_xml}
   </worldbody>
@@ -567,12 +592,25 @@ def terrain_RT_drive_random(seed: int = 0) -> TerrainSpec:
 
     No obstacles. Goal is at least 5 m from start. Tests "basic locomotion"
     over a wide range of starting orientations and goal directions.
+
+    20% of episodes spawn with the goal in the *side* cone (90°-ish manoeuvre)
+    and another 20% put it *behind* the rover (near-U-turn). The rest stay
+    uniform. This trains turning-from-rest in the very first phase so later
+    obstacle / waypoint phases inherit a policy that can already reorient.
     """
     spec = _flat_template("RT_drive_random", max_obstacles=0)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
+        r = rng.uniform()
+        if r < 0.2:
+            bearing = "behind"
+        elif r < 0.4:
+            bearing = "side"
+        else:
+            bearing = "uniform"
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=5.0, margin=2.0,
+            relative_bearing=bearing,
         )
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal,
@@ -584,12 +622,26 @@ def terrain_RT_drive_random(seed: int = 0) -> TerrainSpec:
 
 
 def terrain_RT_with_waypoint(seed: int = 0) -> TerrainSpec:
-    """Phase 1: drive through 1 random waypoint to a random goal. Flat, no obstacles."""
+    """Phase 1: drive through 1 random waypoint to a random goal. Flat, no obstacles.
+
+    Mixes spawn orientations: 60% the goal is straight ahead (`front`), 20%
+    it's off to a side, 20% it's behind. With the manoeuvre-biased starts
+    the rover must turn first, then chase the waypoint. The waypoint itself
+    keeps low lateral jitter so it stays roughly on the post-turn line.
+    """
     spec = _flat_template("RT_with_waypoint", max_obstacles=0)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
+        r = rng.uniform()
+        if r < 0.6:
+            bearing = "front"
+        elif r < 0.8:
+            bearing = "side"
+        else:
+            bearing = "behind"
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=6.0, margin=2.0,
+            relative_bearing=bearing,
         )
         # Lateral jitter reduced 2.0 → 0.8 so the waypoint sits close to the
         # obvious start→goal line. With wider jitter the rover's "drive
@@ -606,17 +658,37 @@ def terrain_RT_with_waypoint(seed: int = 0) -> TerrainSpec:
 
 
 def terrain_RT_with_two_waypoints(seed: int = 0) -> TerrainSpec:
-    """Phase 2: drive through 2 random waypoints to a random goal. Flat, no obstacles."""
+    """Phase 2: drive through 2-4 random waypoints along a TWISTY route.
+
+    The waypoint count itself randomizes (2..4) so the policy has to handle
+    variable-length chains. Routes use `sample_twisty_waypoints` which puts
+    waypoints alternately to the left / right of the straight start→goal
+    line — a real zig-zag the rover must steer through, not jitter around a
+    straight line. Forces the policy to learn segment-by-segment heading
+    changes, not "drive straight and hope a waypoint is close enough".
+    """
     spec = _flat_template("RT_with_two_waypoints", max_obstacles=0)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
+        # Mix start orientations so the policy also learns to turn-then-chase.
+        r = rng.uniform()
+        if r < 0.5:
+            bearing = "front"
+        elif r < 0.8:
+            bearing = "side"
+        else:
+            bearing = "behind"
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=8.0, margin=2.0,
+            relative_bearing=bearing,
         )
-        # Two-waypoint phase: jitter slightly larger than the 1-wp phase so
-        # the policy learns to *steer* rather than drive straight, but still
-        # tight enough that both points are findable.
-        wps = sample_waypoints_between(rng, start, goal, n_waypoints=2, lateral_jitter=1.2)
+        n_wp = int(rng.integers(2, 5))  # 2..4 inclusive
+        wps = sample_twisty_waypoints(
+            rng, start, goal, n_waypoints=n_wp,
+            arena_half=12.0, margin=2.0,
+            swing_min=1.8, swing_max=3.2,
+            alternate_sides=True,
+        )
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal,
             waypoints=wps,
@@ -626,17 +698,27 @@ def terrain_RT_with_two_waypoints(seed: int = 0) -> TerrainSpec:
     return spec
 
 
+_NO_OBSTACLE_PROB = 0.20  # fraction of episodes that get zero obstacles
+
+
 def terrain_RT_one_obstacle(seed: int = 0) -> TerrainSpec:
-    """Phase 3: random start/goal with a single random obstacle in the path."""
+    """Phase 3: random start/goal with up to one random obstacle in the path.
+
+    20% of episodes generate ZERO obstacles. This is critical for the policy
+    to learn that "no obstacle visible" → "drive straight" — otherwise it
+    bakes a "veer wide" prior from the obstacle distribution and overshoots
+    every goal on no-obstacle eval (see report_phase_3_..._on_RT_drive_random).
+    """
     spec = _flat_template("RT_one_obstacle", max_obstacles=1)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=6.0, margin=2.0,
         )
+        n_obs = 0 if rng.uniform() < _NO_OBSTACLE_PROB else 1
         pos, sz = sample_obstacles_along_path(
             rng, start, goal,
-            n_obstacles=1, max_slots=1,
+            n_obstacles=n_obs, max_slots=1,
             size_range=(0.45, 0.65),
             lateral_jitter=0.6,
         )
@@ -649,7 +731,10 @@ def terrain_RT_one_obstacle(seed: int = 0) -> TerrainSpec:
 
 
 def terrain_RT_obstacle_field(seed: int = 0) -> TerrainSpec:
-    """Phase 4: random start/goal with 3-6 random obstacles between them."""
+    """Phase 4: random start/goal with 0-6 random obstacles between them.
+
+    20% no-obstacle episodes (see terrain_RT_one_obstacle docstring).
+    """
     spec = _flat_template("RT_obstacle_field", max_obstacles=6,
                           ground_rgba=(0.55, 0.4, 0.3, 1.0))
 
@@ -657,7 +742,10 @@ def terrain_RT_obstacle_field(seed: int = 0) -> TerrainSpec:
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=7.0, margin=2.0,
         )
-        n = int(rng.integers(3, 7))  # 3..6 inclusive
+        if rng.uniform() < _NO_OBSTACLE_PROB:
+            n = 0
+        else:
+            n = int(rng.integers(3, 7))  # 3..6 inclusive
         pos, sz = sample_obstacles_along_path(
             rng, start, goal,
             n_obstacles=n, max_slots=6,
@@ -673,7 +761,10 @@ def terrain_RT_obstacle_field(seed: int = 0) -> TerrainSpec:
 
 
 def terrain_RT_dense_obstacles(seed: int = 0) -> TerrainSpec:
-    """Phase 5: dense field — 8-12 random obstacles. Tests precision navigation."""
+    """Phase 5: dense field — 0-12 random obstacles. Tests precision navigation.
+
+    20% no-obstacle episodes (see terrain_RT_one_obstacle docstring).
+    """
     spec = _flat_template("RT_dense_obstacles", max_obstacles=12,
                           ground_rgba=(0.5, 0.35, 0.3, 1.0))
 
@@ -681,7 +772,10 @@ def terrain_RT_dense_obstacles(seed: int = 0) -> TerrainSpec:
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=8.0, margin=2.0,
         )
-        n = int(rng.integers(8, 13))  # 8..12 inclusive
+        if rng.uniform() < _NO_OBSTACLE_PROB:
+            n = 0
+        else:
+            n = int(rng.integers(8, 13))  # 8..12 inclusive
         pos, sz = sample_obstacles_along_path(
             rng, start, goal,
             n_obstacles=n, max_slots=12,
@@ -758,23 +852,38 @@ def terrain_RT_mixed(seed: int = 0) -> TerrainSpec:
     )
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
+        # 30% manoeuvre start (side/behind), 70% uniform.
+        bearing = "maneuver" if rng.uniform() < 0.3 else "uniform"
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=11.0, min_separation=7.0, margin=2.5,
+            relative_bearing=bearing,
         )
-        # 0-1 waypoints (varied across episodes), 4-8 obstacles.
-        n_wp = int(rng.integers(0, 2))
-        wps = (sample_waypoints_between(rng, start, goal, n_wp, lateral_jitter=2.0)
-               if n_wp > 0 else ())
+        # 0-2 twisty waypoints, 4-8 obstacles.
+        n_wp = int(rng.integers(0, 3))
+        wps = (
+            sample_twisty_waypoints(
+                rng, start, goal, n_waypoints=n_wp,
+                arena_half=11.0, margin=2.5,
+                swing_min=1.5, swing_max=2.8,
+                alternate_sides=True,
+            )
+            if n_wp > 0 else ()
+        )
+        # Generate the heightmap first so obstacles can sit ON the terrain
+        # surface, not buried at z=0. RT_mixed elevation_z = 0.35 m so this
+        # is a non-trivial correction.
+        hm = generate_heightmap_perlin(
+            nrow=48, ncol=48, scale=0.10, octaves=3,
+            seed=int(rng.integers(0, 10_000_000)),
+        )
+        hm_extent = (11.0, 11.0, 0.35)
         n_obs = int(rng.integers(4, 9))  # 4..8 inclusive
         pos, sz = sample_obstacles_along_path(
             rng, start, goal,
             n_obstacles=n_obs, max_slots=8,
             size_range=(0.4, 0.65),
             lateral_jitter=2.0,
-        )
-        hm = generate_heightmap_perlin(
-            nrow=48, ncol=48, scale=0.10, octaves=3,
-            seed=int(rng.integers(0, 10_000_000)),
+            heightmap=hm, heightmap_extent=hm_extent,
         )
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,

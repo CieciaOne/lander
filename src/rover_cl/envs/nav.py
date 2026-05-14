@@ -91,8 +91,16 @@ class RoverNavEnv(gym.Env):
         control_decimation: int = 5,
         progress_reward_scale: float = 5.0,
         goal_bonus: float = 50.0,
-        collision_penalty: float = 3.0,      # per-step while in contact
-        hit_penalty: float = 10.0,           # one-shot on collision transition
+        # Collision penalties softened from (3.0/step + 10 hit) → (1.5/step
+        # + 5 hit). Previous values made "freeze near start" a strictly
+        # better local optimum than "move and risk a graze" — see the
+        # phase-5/8 reports where every episode terminated at exactly
+        # `stuck_window_steps` with the rover wiggling in place. Halved
+        # collision deterrents combined with a much larger stuck-no-
+        # progress penalty (below) reverse the gradient: any progress at
+        # all dominates freezing.
+        collision_penalty: float = 1.5,      # per-step while in contact
+        hit_penalty: float = 5.0,            # one-shot on collision transition
         step_cost: float = 0.01,
         tipped_penalty: float = 20.0,
         # Proximity penalty disabled by default. The hit_penalty (+collision_penalty
@@ -127,7 +135,32 @@ class RoverNavEnv(gym.Env):
         collision_terminate_steps: int = 30,   # ≈ 0.75 s in continuous contact
         stuck_window_steps: int = 200,         # ≈ 5 s with no measurable progress
         stuck_min_progress: float = 0.5,       # m of d_target reduction required
-        early_terminate_penalty: float = 5.0,  # one-shot when either guard fires
+        # Split the early-terminate penalty by failure mode. Freezing
+        # (stuck_no_progress) used to fire the same 5.0 penalty as "wedged
+        # in collision", which made freezing a strict win: 200 steps × 0.01
+        # step cost + 5 penalty = -7, versus 30 × 1.5 + 5 + 5 = -55 for a
+        # genuine collision attempt. New defaults: 30 penalty on freezing
+        # (≈ matches the collision-streak cost), 5 on collision-streak
+        # termination (already paid via collision_penalty).
+        stuck_no_progress_penalty: float = 30.0,
+        stuck_in_collision_penalty: float = 5.0,
+        # Backwards-compat alias. Older callers (and tests) pass
+        # `early_terminate_penalty=X` — split it into the two new
+        # parameters when provided.
+        early_terminate_penalty: float | None = None,
+        # Action smoothness penalty. Per step, scales the squared L2 norm
+        # of (action_t - action_{t-1}). Max possible per step is 4 × 2 = 8
+        # (both action dims swing -1 → +1). The 0.05 scale caps the per-
+        # step penalty at -0.4 in the pathological case; typical run cost
+        # is ~10 over an episode. Damps the jagged "boogie woogie" paths
+        # seen in scenario_10 reports without overpowering the progress
+        # gradient.
+        action_jerk_scale: float = 0.05,
+        # Wheel-grounded penalty: -wheels_off_scale × n_wheels_off per step.
+        # 6 wheels off (rover airborne) costs 0.18/step. Discourages
+        # aggressive turns that lift the rocker-bogie clear of the ground.
+        # Set to 0.0 to disable (e.g. on dunes where some lift is normal).
+        wheels_off_scale: float = 0.03,
         # Adaptive time budget: when a waypoint is reached, extend `max_steps`
         # by `waypoint_time_bonus_per_metre * dist_to_next_target + waypoint_time_bonus_base`.
         # Lets episodes with widely-spaced targets actually finish without
@@ -160,7 +193,13 @@ class RoverNavEnv(gym.Env):
         self.collision_terminate_steps = collision_terminate_steps
         self.stuck_window_steps = stuck_window_steps
         self.stuck_min_progress = stuck_min_progress
-        self.early_terminate_penalty = early_terminate_penalty
+        if early_terminate_penalty is not None:
+            stuck_no_progress_penalty = early_terminate_penalty
+            stuck_in_collision_penalty = early_terminate_penalty
+        self.stuck_no_progress_penalty = stuck_no_progress_penalty
+        self.stuck_in_collision_penalty = stuck_in_collision_penalty
+        self.action_jerk_scale = action_jerk_scale
+        self.wheels_off_scale = wheels_off_scale
         self.waypoint_time_bonus_per_metre = waypoint_time_bonus_per_metre
         self.waypoint_time_bonus_base = waypoint_time_bonus_base
         self.render_mode = render_mode
@@ -191,8 +230,14 @@ class RoverNavEnv(gym.Env):
         ]
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        # obs = goal-relative pose (6) + K obstacles × (fwd_min, fwd_max, right_min, right_max).
-        obs_dim = 6 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+        # obs layout:
+        #   [0..6)  pose+velocity vs current target (6 dims)
+        #   [6..8)  NEXT target rel_fwd, rel_right (lookahead — sentinel (0, 0)
+        #           if there's no next target, i.e. current target IS the goal).
+        #           Lets the policy plan its trajectory across waypoint
+        #           boundaries instead of swinging wide at every transition.
+        #   [8..)   K obstacles × (fwd_min, fwd_max, right_min, right_max)
+        obs_dim = 6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -306,20 +351,69 @@ class RoverNavEnv(gym.Env):
         linvel = self._sensor(self._base_linvel_id, 3)[:2]
         angvel_z = float(self._sensor(self._base_angvel_id, 3)[2])
 
+        # Lookahead: where's the NEXT target in body frame? When the rover is
+        # heading toward waypoint W_k, knowing where W_{k+1} sits lets it
+        # round corners instead of swerving to W_k then yanking the wheel
+        # toward W_{k+1}. If there is no next target (current target IS the
+        # final goal), use a sentinel (0, 0) so the policy reads "no further
+        # plan beyond this".
+        if self._wp_idx + 1 < len(self._targets):
+            nxt = np.array(self._targets[self._wp_idx + 1], dtype=np.float32)
+            d_nxt = nxt - pos_xy
+            rel_fwd_next   = -s * d_nxt[0] + c * d_nxt[1]
+            rel_right_next =  c * d_nxt[0] + s * d_nxt[1]
+        else:
+            rel_fwd_next = 0.0
+            rel_right_next = 0.0
+
         obstacle_feats, min_obstacle_dist = self._build_obstacle_features(pos_xy, yaw)
         # Stash min distance so step() can reuse it for the proximity penalty
         # without rebuilding the feature list.
         self._min_obstacle_dist = min_obstacle_dist
 
-        obs = np.empty(6 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT, dtype=np.float32)
+        obs = np.empty(6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT, dtype=np.float32)
         obs[0] = rel_fwd
         obs[1] = rel_right
         obs[2] = heading_to_goal
         obs[3] = float(linvel[0])
         obs[4] = float(linvel[1])
         obs[5] = angvel_z
-        obs[6:] = obstacle_feats
+        obs[6] = float(rel_fwd_next)
+        obs[7] = float(rel_right_next)
+        obs[8:] = obstacle_feats
         return obs
+
+    _WHEEL_GEOM_NAMES = (
+        "wheel_rf", "wheel_rm", "wheel_rr",
+        "wheel_lf", "wheel_lm", "wheel_lr",
+    )
+
+    def _count_wheels_off_ground(self) -> int:
+        """Return how many of the 6 wheels are NOT in contact with any non-rover geom.
+
+        Iterates `data.contact[:ncon]`, building the set of wheel geom ids
+        that touch *anything* other than another rover-tree geom this step.
+        A wheel touching the ground or an obstacle counts as grounded; only
+        wheels with zero ground/world contacts this step are "off".
+        """
+        if not hasattr(self, "_wheel_geom_ids"):
+            self._wheel_geom_ids = []
+            for n in self._WHEEL_GEOM_NAMES:
+                gid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, n)
+                if gid >= 0:
+                    self._wheel_geom_ids.append(gid)
+        if not self._wheel_geom_ids:
+            return 0
+        grounded = set()
+        wheel_set = set(self._wheel_geom_ids)
+        for i in range(self._data.ncon):
+            c = self._data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if g1 in wheel_set and g2 not in wheel_set:
+                grounded.add(g1)
+            elif g2 in wheel_set and g1 not in wheel_set:
+                grounded.add(g2)
+        return len(self._wheel_geom_ids) - len(grounded)
 
     def _detect_collision(self) -> bool:
         """True iff any rover-tree body is in contact with a geom named `obs_*`.
@@ -443,17 +537,30 @@ class RoverNavEnv(gym.Env):
             sy = sy + float(self.np_random.uniform(-self.start_jitter_pos, self.start_jitter_pos))
         self._data.qpos[0] = sx
         self._data.qpos[1] = sy
-        # Spawn slightly above equilibrium (settled chassis z ≈ 0.75 on flat
-        # ground; higher on hfield where the surface itself is elevated).
-        # Spawning BELOW makes the wheels start *inside* the ground, MuJoCo's
-        # contact solver shoots the chassis upward, and the rover is mid-bounce
-        # when the episode begins.
-        hfield_max = 0.0
+        # Spawn slightly above the LOCAL ground height at the rover's spawn XY,
+        # not above the global max-elevation. The old "0.95 + hfield_max" rule
+        # was conservative — it ensured the wheels never started buried — but
+        # on dunes it dropped the rover from up to 1.55 m above ground, which
+        # exceeded the 150-step (0.75 s) settle budget and left the suspension
+        # still bouncing when the episode began.
+        #
+        # New approach: query the heightmap at (sx, sy), spawn `SPAWN_CLEARANCE`
+        # metres above that point. Same fall distance everywhere, regardless of
+        # dune geometry, so the settle phase has a consistent budget.
+        from rover_cl.envs.randomization import heightmap_height_at_xy
+        terrain_z_here = 0.0
         if self.terrain.heightmap is not None:
-            # heightmap is normalized to [0, 1]; heightmap_extent[2] is the
-            # elevation_z multiplier in metres.
-            hfield_max = float(self.terrain.heightmap_extent[2])
-        self._data.qpos[2] = 0.95 + hfield_max
+            terrain_z_here = heightmap_height_at_xy(
+                self.terrain.heightmap,
+                self.terrain.heightmap_extent,
+                sx, sy,
+            )
+        # SPAWN_CLEARANCE: base_link sits ≈ 0.75 m above ground at rest (see
+        # `settled chassis z` note in CLAUDE.md). Add 0.20 m so the wheels
+        # start ~20 cm above the ground, which is just enough drop to engage
+        # the rocker-bogie without violent impact.
+        SPAWN_CLEARANCE = 0.20
+        self._data.qpos[2] = terrain_z_here + 0.75 + SPAWN_CLEARANCE
         # yaw quaternion (w, x, y, z) around Z, with optional jitter.
         yaw = self.terrain.start_yaw
         if self.start_jitter_yaw > 0:
@@ -504,11 +611,19 @@ class RoverNavEnv(gym.Env):
         # and we end the episode early.
         self._best_d_target = self._prev_dist
         self._steps_since_progress = 0
+        # Action smoothness: previous step's action, used by the jerk penalty.
+        # First step has no prior action; init to zero (no penalty on step 1).
+        self._prev_action = np.zeros(2, dtype=np.float64)
         obs = self._build_obs()
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         action = np.clip(action, -1.0, 1.0).astype(np.float64)
+        # Action-jerk penalty: squared L2 of the action change since last
+        # step. Computed up-front so we can stash `_prev_action` cleanly
+        # at the end.
+        action_jerk_sq = float(np.sum((action - self._prev_action) ** 2))
+        action_jerk_penalty = self.action_jerk_scale * action_jerk_sq
         throttle = float(action[0])
         steer    = float(action[1])
         # All 6 drive wheels at the same speed. positive ctrl rolls -Y so we
@@ -563,8 +678,22 @@ class RoverNavEnv(gym.Env):
                     + self.waypoint_time_bonus_base
                 )
                 self._effective_max_steps += bonus_steps
+                # Critical: reset stuck-detection state. _best_d_target was
+                # tracking the OLD target's minimum distance (a small number
+                # because the rover just reached it). Without this reset, the
+                # NEW target's distance is suddenly much larger, the stuck
+                # guard never sees "progress" against the stale best, and the
+                # episode dies ~200 steps after every waypoint hit. Reset both
+                # the reference distance and the no-progress counter.
+                self._best_d_target = dist_to_next
+                self._steps_since_progress = 0
         else:
             self._goal_hold = 0
+
+        # Wheels-off-ground penalty: counts wheels with zero contact this
+        # step. Stash the count for info-dict reporting too.
+        n_wheels_off = self._count_wheels_off_ground()
+        wheels_off_penalty = self.wheels_off_scale * float(n_wheels_off)
 
         collision = self._detect_collision()
         # One-shot hit penalty fires on the step the rover *enters* contact, so
@@ -579,11 +708,18 @@ class RoverNavEnv(gym.Env):
 
         # Stuck-detection bookkeeping: reset the no-progress counter every time
         # we beat the best-ever distance by at least stuck_min_progress metres.
-        if dist < self._best_d_target - self.stuck_min_progress:
-            self._best_d_target = dist
-            self._steps_since_progress = 0
-        else:
-            self._steps_since_progress += 1
+        # Skip on steps where a waypoint was just hit — the waypoint-advance
+        # branch above already reset `_best_d_target` / `_steps_since_progress`
+        # to track the NEW target. Without this skip, the stale `dist` (≈ 0,
+        # measured against the JUST-REACHED old target) clobbers the reset and
+        # makes the new target's "best" 0 — guaranteeing a stuck-trigger 200
+        # steps later.
+        if waypoint_reached_bonus == 0.0:
+            if dist < self._best_d_target - self.stuck_min_progress:
+                self._best_d_target = dist
+                self._steps_since_progress = 0
+            else:
+                self._steps_since_progress += 1
 
         upright = self._upright_cos()
         tipped = upright < TIP_OVER_COS
@@ -634,7 +770,10 @@ class RoverNavEnv(gym.Env):
             - (self.collision_penalty if collision else 0.0)
             - (self.hit_penalty if new_hit else 0.0)
             - (self.tipped_penalty if tipped else 0.0)
-            - (self.early_terminate_penalty if early_terminate and not success else 0.0)
+            - (self.stuck_in_collision_penalty if stuck_in_collision and not success else 0.0)
+            - (self.stuck_no_progress_penalty if stuck_no_progress and not success else 0.0)
+            - action_jerk_penalty
+            - wheels_off_penalty
             + waypoint_reached_bonus
             + speed_bonus
             + (self.goal_bonus if success else 0.0)
@@ -650,6 +789,9 @@ class RoverNavEnv(gym.Env):
         # state access. Cheap (3 floats / step) and lets `rollout_with_trajectory`
         # build top-down path plots without coupling to env internals.
         _, yaw_now = self._base_pose_xy()
+        # Remember this action for next-step jerk.
+        self._prev_action = action.copy()
+
         info: dict[str, Any] = {
             "distance_to_goal": dist_to_goal,
             "distance_to_target": dist,
@@ -661,6 +803,7 @@ class RoverNavEnv(gym.Env):
             "stuck_no_progress": bool(stuck_no_progress),
             "pos_xy": (float(pos_xy[0]), float(pos_xy[1])),
             "yaw": float(yaw_now),
+            "n_wheels_off_ground": int(n_wheels_off),
         }
         if terminated or truncated:
             info["episode"] = EpisodeOutcome(

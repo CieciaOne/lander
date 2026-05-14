@@ -66,20 +66,22 @@ _EPISODE_COLORS = [
 def _episode_speed_cmap(hex_color: str) -> "mpl.colors.LinearSegmentedColormap":
     """Build a per-episode colormap that fades from light (slow) to dark (fast).
 
-    The episode is identified by hue (the base colour), and speed is encoded
-    in lightness: slow segments are pale tints, fast segments are saturated.
-    Stays unambiguous across 12 episode hues *and* preserves speed gradient
-    information that the previous magma-uniform-across-episodes ramp lost.
+    The episode is identified by hue (the base colour); speed is encoded in
+    lightness. Goes from a very pale tint (slow) directly to a strongly
+    darkened+saturated version (fast) — no middle anchor, so the whole
+    speed range exercises the full lightness contrast. Needed because the
+    rover's per-step speed range is narrow (~0.4 m/s wide) and a softer
+    gradient was visually indistinguishable from a solid line.
     """
     import colorsys
     r, g, b, _ = mpl.colors.to_rgba(hex_color)
     h, l, s = colorsys.rgb_to_hls(r, g, b)
-    # Light end: lift lightness, drop saturation so it reads as "faded"
-    light = colorsys.hls_to_rgb(h, min(0.92, l + 0.42), max(0.18, s - 0.25))
-    # Dark end: saturate + darken slightly
-    dark = colorsys.hls_to_rgb(h, max(0.18, l - 0.10), min(1.0, s + 0.05))
+    # Slow end: nearly white with a tint of the hue.
+    light = colorsys.hls_to_rgb(h, 0.93, max(0.12, s - 0.35))
+    # Fast end: strongly darkened, fully saturated.
+    dark = colorsys.hls_to_rgb(h, max(0.16, l - 0.32), min(1.0, s + 0.20))
     return mpl.colors.LinearSegmentedColormap.from_list(
-        f"ep_{hex_color}", [light, hex_color, dark], N=128,
+        f"ep_{hex_color}", [light, dark], N=256,
     )
 
 # Soft text/face colours used throughout — kept here so plot tweaks stay
@@ -611,16 +613,28 @@ def plot_run_report(
         return _EPISODE_COLORS[i % len(_EPISODE_COLORS)]
 
     if randomized_mode:
-        # Draw each episode's obstacles in that episode's colour, low alpha.
+        # Draw each episode's obstacles in that episode's colour. Higher alpha
+        # + a darker outline than before so dense scenes don't visually
+        # collapse into a beige blob when 5 episodes' obstacle layouts overlap.
+        # Shadow underneath ties them to the ground (visual reference).
+        import colorsys as _cs
         for i, tr in enumerate(trajectories):
             ec = _ep_color(i)
             if tr.obstacle_layout is None:
                 continue
+            r, g, b, _ = mpl.colors.to_rgba(ec)
+            h, l, s = _cs.rgb_to_hls(r, g, b)
+            edge_rgb = _cs.hls_to_rgb(h, max(0.10, l - 0.28), s)
             for cx, cy, sx, sy in tr.obstacle_layout:
+                # Drop shadow.
+                ax.add_patch(mpl.patches.Rectangle(
+                    (cx - sx + 0.05, cy - sy - 0.05), 2 * sx, 2 * sy,
+                    facecolor="black", alpha=0.10, linewidth=0, zorder=1.6,
+                ))
                 ax.add_patch(mpl.patches.Rectangle(
                     (cx - sx, cy - sy), 2 * sx, 2 * sy,
-                    facecolor=ec, edgecolor=ec,
-                    linewidth=0.5, alpha=0.28, zorder=2,
+                    facecolor=ec, edgecolor=edge_rgb,
+                    linewidth=1.0, alpha=0.55, zorder=2,
                 ))
     else:
         for ob in terrain.obstacles:
@@ -737,9 +751,14 @@ def plot_run_report(
         speeds = np.linalg.norm(np.diff(tr.positions, axis=0), axis=1) / DT_PER_STEP
         max_speed_observed = max(max_speed_observed, float(speeds.max(initial=0.0)))
         per_traj_segments_and_speeds.append((seg, speeds))
-    # cap the colormap upper bound: gives consistent meaning across episodes
-    # even when one outlier hits an unrealistic spike.
-    vmax = max(0.6, min(max_speed_observed, 1.5))  # m/s
+    # Speed-normalization range. Anchored to the rover's THEORETICAL top
+    # speed (MAX_WHEEL_VEL × wheel_radius = 3.0 rad/s × 0.25 m = 0.75 m/s),
+    # so the colormap depth reads as "fraction of the rover's capability
+    # actually being used." Speeds slightly above 0.75 (from slip /
+    # momentum / slope) clip to the darkest colour — fine, the point of
+    # interest is utilisation, not exceeding the theoretical bound.
+    ROVER_THEORETICAL_TOP_SPEED = 0.75  # m/s — matches RoverNavEnv
+    vmax = ROVER_THEORETICAL_TOP_SPEED
     norm_speed = mpl.colors.Normalize(vmin=0.0, vmax=vmax)
 
     outcome_color = {
@@ -814,10 +833,15 @@ def plot_run_report(
     if all_contacts:
         # Contacts are X-marks coloured per-episode in randomized mode (so a
         # contact belongs to a specific path), else single C_CONTACT colour.
+        # White outer halo + bold X so contacts read clearly against obstacle
+        # rectangles and heightmap shading.
         xs = [c[0] for c in all_contacts]
         ys = [c[1] for c in all_contacts]
         colors = [c[2] for c in all_contacts]
-        ax.scatter(xs, ys, marker="x", s=26, c=colors, linewidths=1.4, zorder=6)
+        ax.scatter(xs, ys, marker="o", s=80, c="white",
+                   edgecolors="none", alpha=0.85, zorder=5.9)
+        ax.scatter(xs, ys, marker="x", s=70, c=colors,
+                   linewidths=2.2, zorder=6)
 
     legend_handles: list = []
     if randomized_mode:

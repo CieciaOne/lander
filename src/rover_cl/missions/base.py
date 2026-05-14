@@ -16,9 +16,50 @@ from pathlib import Path
 from typing import Callable
 
 import gymnasium as gym
+from stable_baselines3.common.callbacks import BaseCallback
 
 from rover_cl.cl import CLMethod, make_cl
 from rover_cl.eval.metrics import EpisodeStats, evaluate_with_trajectories
+
+
+class EpisodeCounter(BaseCallback):
+    """SB3 callback that counts completed episodes during a training phase.
+
+    On each environment step, SB3 puts the per-env `infos` and `dones`
+    arrays into `self.locals`. A done flag = one completed episode (works
+    for both single-env and SubprocVecEnv setups). We also track the mean
+    episode length across all completed episodes so the Runner can print
+    "episodes=K (mean len=L steps)" in the per-phase summary.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(verbose=0)
+        self.n_episodes: int = 0
+        self.total_episode_steps: int = 0
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get("dones")
+        if dones is None:
+            return True
+        infos = self.locals.get("infos") or []
+        for i, done in enumerate(dones):
+            if not bool(done):
+                continue
+            self.n_episodes += 1
+            # SB3's Monitor wrapper places `episode: {"r": ..., "l": ..., "t": ...}`
+            # into the info dict on the terminal step. Use the reported length
+            # when available; else fall back to a single step.
+            info_i = infos[i] if i < len(infos) else {}
+            ep = info_i.get("episode") if isinstance(info_i, dict) else None
+            if isinstance(ep, dict) and "l" in ep:
+                self.total_episode_steps += int(ep["l"])
+        return True
+
+    @property
+    def mean_episode_length(self) -> float:
+        if self.n_episodes == 0:
+            return 0.0
+        return self.total_episode_steps / self.n_episodes
 
 
 EnvFactory = Callable[[int], gym.Env]
@@ -32,6 +73,13 @@ class Task:
     train_timesteps: int = 20_000
     eval_episodes: int = 10
     eval_max_steps: int = 500
+    # Per-phase PPO entropy-coefficient override. When set, the Runner
+    # updates `cl.model.ent_coef` to this value before `model.learn()`.
+    # Used by scenario_10 to raise exploration on the obstacle-heavy
+    # phases (3-5) — those phases were getting stuck in the "freeze near
+    # start" local minimum, which higher entropy helps escape. None means
+    # "leave the default from PPO kwargs alone".
+    ent_coef: float | None = None
 
 
 @dataclass
@@ -185,16 +233,27 @@ class Runner:
                 train_env = task.env_factory(self.mission.seed + phase)
 
             # --- training ----------------------------------------------------
+            episode_counter = EpisodeCounter()
             train_start = time.perf_counter()
+            if task.ent_coef is not None:
+                self._log(f"  ent_coef override: {task.ent_coef:.4f} for this phase")
             cl.train_on(
                 env=train_env,
                 total_timesteps=task.train_timesteps,
                 task_id=task.task_id,
                 log_dir=tb_dir,
                 skip_post_train=using_vec,
+                callback=episode_counter,
+                ent_coef=task.ent_coef,
             )
             train_seconds = time.perf_counter() - train_start
-            self._log(f"  training done in {self._fmt_dur(train_seconds)}")
+            n_train_episodes = episode_counter.n_episodes
+            mean_ep_len = episode_counter.mean_episode_length
+            self._log(
+                f"  training done in {self._fmt_dur(train_seconds)} · "
+                f"episodes={n_train_episodes} "
+                f"(mean len={mean_ep_len:.0f} steps)"
+            )
 
             try:
                 train_env.close()
@@ -275,6 +334,11 @@ class Runner:
                 "post_train_seconds": round(post_train_seconds, 2),
                 "eval_seconds": round(eval_seconds, 2),
                 "total_seconds": round(phase_total_seconds, 2),
+                # Episode-level training stats, surfaced into results.json so
+                # "how many agent runs happened in each phase" is recoverable
+                # without re-parsing logs.
+                "train_episodes": int(n_train_episodes),
+                "train_mean_episode_steps": round(mean_ep_len, 1),
             }
             evaluations.append(PhaseResult(
                 phase=phase, after_training=task.task_id,

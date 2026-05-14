@@ -34,6 +34,47 @@ import numpy as np
 HIDE_Z: float = -50.0
 
 
+def heightmap_height_at_xy(
+    heightmap: np.ndarray | None,
+    extent: tuple[float, float, float],
+    x: float,
+    y: float,
+) -> float:
+    """Return the world-z elevation of the heightmap at (x, y).
+
+    Bilinear-samples the heightmap (rows = y, cols = x) and scales by the
+    extent's elevation_z. Returns 0.0 when `heightmap is None` (i.e. the
+    terrain is a flat plane). Out-of-bounds (x, y) clamp to the edge cell.
+
+    The heightmap is stored normalized to [0, 1]; the world elevation is
+    `heightmap[i, j] * elevation_z`. The (i, j) → (x, y) mapping matches
+    MuJoCo's hfield: row index increases with y, column with x, and the
+    field spans (-half, +half) in both dimensions where half is `extent[0]`
+    / `extent[1]`.
+    """
+    if heightmap is None:
+        return 0.0
+    hx, hy, ez = extent
+    nrow, ncol = heightmap.shape
+    if ez == 0.0 or nrow == 0 or ncol == 0:
+        return 0.0
+    # Normalise (x, y) into row/col index space.
+    fx = (x + hx) / (2 * hx) * (ncol - 1)
+    fy = (y + hy) / (2 * hy) * (nrow - 1)
+    j = int(np.clip(np.floor(fx), 0, ncol - 2))
+    i = int(np.clip(np.floor(fy), 0, nrow - 2))
+    tx = float(np.clip(fx - j, 0.0, 1.0))
+    ty = float(np.clip(fy - i, 0.0, 1.0))
+    h00 = float(heightmap[i,     j])
+    h01 = float(heightmap[i,     j + 1])
+    h10 = float(heightmap[i + 1, j])
+    h11 = float(heightmap[i + 1, j + 1])
+    h0 = h00 * (1 - tx) + h01 * tx
+    h1 = h10 * (1 - tx) + h11 * tx
+    h = h0 * (1 - ty) + h1 * ty
+    return float(h * ez)
+
+
 @dataclass
 class TerrainRoll:
     """One episode's randomized terrain values.
@@ -75,23 +116,90 @@ def sample_start_goal_pair(
     arena_half: float,
     min_separation: float,
     margin: float = 1.0,
+    *,
+    relative_bearing: str = "uniform",
 ) -> tuple[tuple[float, float], float, tuple[float, float]]:
     """Pick (start, yaw, goal) with goal at least `min_separation` from start.
 
-    Start yaw is uniform in [-π, π]; the policy must learn that "goal ahead"
-    is rel_fwd > 0 regardless of starting orientation.
+    `relative_bearing` controls where the goal sits relative to the rover's
+    facing direction (defined by `yaw`):
+
+    - ``"uniform"`` — default; goal direction uniform in the full circle
+      (`yaw` then uniform in [-π, π] so absolute orientation also varies).
+      The policy must learn that "goal ahead" is `rel_fwd > 0` regardless of
+      starting orientation.
+    - ``"front"`` — goal is in the front 120° cone (|bearing| ≤ π/3). The
+      easy case — exercises forward driving.
+    - ``"side"`` — goal lies far to the rover's side (|bearing| ∈ [π/3, 2π/3]).
+      Forces the rover to execute a 90°-ish turn before driving forward.
+    - ``"behind"`` — goal is in the back 120° cone (|bearing| > 2π/3). Forces
+      a near-U-turn manoeuvre at episode start.
+    - ``"maneuver"`` — equal mix of side and behind. Used by phases that
+      specifically train manoeuvring rather than straight driving.
 
     `margin` keeps both points away from the arena boundary.
     """
+    if relative_bearing not in {"uniform", "front", "side", "behind", "maneuver"}:
+        raise ValueError(f"unknown relative_bearing {relative_bearing!r}")
+
+    # Map mode → allowed bearing range (in radians, measured from rover +Y).
+    if relative_bearing == "uniform":
+        bearing_range: tuple[float, float] | None = None
+    elif relative_bearing == "front":
+        bearing_range = (-np.pi / 3, np.pi / 3)
+    elif relative_bearing == "side":
+        # |bearing| ∈ [60°, 120°] on either side. Pick a side, then a
+        # magnitude in that band.
+        bearing_range = ("side",)  # sentinel; sampled below
+    elif relative_bearing == "behind":
+        bearing_range = ("behind",)  # |bearing| ∈ [120°, 180°]
+    else:  # "maneuver" — 50/50 side or behind
+        bearing_range = ("maneuver",)
+
     bound = arena_half - margin
-    for _ in range(50):
+    for _ in range(80):
         start = _sample_point_in_box(rng, (-bound, bound), (-bound, bound))
-        goal = _sample_point_in_box(rng, (-bound, bound), (-bound, bound))
-        dx, dy = goal[0] - start[0], goal[1] - start[1]
-        if (dx * dx + dy * dy) ** 0.5 >= min_separation:
-            yaw = float(rng.uniform(-np.pi, np.pi))
-            return start, yaw, goal
-    # Degenerate fallback if 50 samples failed (shouldn't happen for sane bounds).
+        yaw = float(rng.uniform(-np.pi, np.pi))
+
+        # Sample (distance, relative bearing) of the goal in rover frame.
+        if bearing_range is None:
+            # Original behaviour: goal anywhere in the box, yaw independent.
+            goal = _sample_point_in_box(rng, (-bound, bound), (-bound, bound))
+            dx, dy = goal[0] - start[0], goal[1] - start[1]
+            if (dx * dx + dy * dy) ** 0.5 >= min_separation:
+                return start, yaw, goal
+            continue
+
+        if bearing_range == ("side",):
+            sign = 1.0 if rng.uniform() < 0.5 else -1.0
+            rel_bearing = sign * float(rng.uniform(np.pi / 3, 2 * np.pi / 3))
+        elif bearing_range == ("behind",):
+            sign = 1.0 if rng.uniform() < 0.5 else -1.0
+            rel_bearing = sign * float(rng.uniform(2 * np.pi / 3, np.pi))
+        elif bearing_range == ("maneuver",):
+            sign = 1.0 if rng.uniform() < 0.5 else -1.0
+            if rng.uniform() < 0.5:
+                rel_bearing = sign * float(rng.uniform(np.pi / 3, 2 * np.pi / 3))
+            else:
+                rel_bearing = sign * float(rng.uniform(2 * np.pi / 3, np.pi))
+        else:
+            lo, hi = bearing_range
+            rel_bearing = float(rng.uniform(lo, hi))
+
+        # Convert (yaw + rel_bearing) into a world heading from start.
+        # Rover's forward is +Y in body frame, so world heading is yaw + 90°
+        # (i.e. +Y in body = (-sin(yaw), cos(yaw)) in world). A goal at
+        # `rel_bearing=0` should sit straight ahead along that vector.
+        world_bearing = yaw + np.pi / 2 + rel_bearing
+        # Distance: at least `min_separation`, up to whatever fits in the box
+        # given the start and a small safety margin.
+        max_d = min_separation + float(rng.uniform(0.0, 4.0))
+        gx = start[0] + max_d * float(np.cos(world_bearing))
+        gy = start[1] + max_d * float(np.sin(world_bearing))
+        if abs(gx) <= bound and abs(gy) <= bound:
+            return start, yaw, (gx, gy)
+
+    # Degenerate fallback if all attempts failed (very tight bounds).
     return (0.0, 0.0), 0.0, (0.0, min_separation)
 
 
@@ -126,6 +234,77 @@ def sample_waypoints_between(
     return tuple(out)
 
 
+def sample_twisty_waypoints(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    goal: tuple[float, float],
+    n_waypoints: int,
+    arena_half: float,
+    margin: float = 1.5,
+    *,
+    swing_min: float = 2.5,
+    swing_max: float = 5.0,
+    alternate_sides: bool = True,
+) -> tuple[tuple[float, float], ...]:
+    """Place waypoints along a snaking path with real twists between them.
+
+    Unlike `sample_waypoints_between` (which jitters perpendicular to the
+    straight start→goal line), this builds a snake: each waypoint sits at
+    successive fractions along the line, but its perpendicular offset
+    *alternates sign* and varies in magnitude, producing a left-right-left
+    zig-zag route the rover must steer through. With many waypoints the
+    route ends up looking like a sinusoidal weave.
+
+    Parameters
+    ----------
+    arena_half / margin
+        Used to clamp the generated waypoints inside the arena so we don't
+        spawn one outside the playable region.
+    swing_min / swing_max
+        Lateral magnitude range (m). Larger ⇒ tighter, sharper turns.
+    alternate_sides
+        When True (default) sides strictly alternate (deterministic zig-zag
+        skeleton, magnitudes randomized). When False each waypoint flips
+        sides with probability 0.5, producing a freer random walk.
+    """
+    sx, sy = start
+    gx, gy = goal
+    dx, dy = gx - sx, gy - sy
+    length = (dx * dx + dy * dy) ** 0.5
+    if length < 1e-6 or n_waypoints <= 0:
+        return ()
+    fx, fy = dx / length, dy / length
+    lx, ly = -fy, fx
+    bound = arena_half - margin
+
+    # First-leg side: random so we don't always twist the same direction
+    # across episodes.
+    side = 1.0 if rng.uniform() < 0.5 else -1.0
+
+    out: list[tuple[float, float]] = []
+    for i in range(n_waypoints):
+        t = (i + 1) / (n_waypoints + 1)
+        # Add some along-axis jitter too — keeps the rover from learning a
+        # fixed spacing pattern.
+        t_jitter = float(rng.uniform(-0.07, 0.07))
+        t_eff = float(np.clip(t + t_jitter, 0.05, 0.95))
+        along_x = sx + t_eff * dx
+        along_y = sy + t_eff * dy
+        magnitude = float(rng.uniform(swing_min, swing_max))
+        wx = along_x + side * magnitude * lx
+        wy = along_y + side * magnitude * ly
+        # Clamp into the arena.
+        wx = float(np.clip(wx, -bound, bound))
+        wy = float(np.clip(wy, -bound, bound))
+        out.append((wx, wy))
+        if alternate_sides:
+            side = -side
+        else:
+            if rng.uniform() < 0.5:
+                side = -side
+    return tuple(out)
+
+
 def sample_obstacles_along_path(
     rng: np.random.Generator,
     start: tuple[float, float],
@@ -135,12 +314,21 @@ def sample_obstacles_along_path(
     size_range: tuple[float, float],
     lateral_jitter: float,
     along_jitter_fraction: float = 0.7,
+    heightmap: np.ndarray | None = None,
+    heightmap_extent: tuple[float, float, float] = (15.0, 15.0, 0.0),
 ) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
     """Place `n_obstacles` random boxes roughly between start and goal.
 
     Each obstacle is positioned at a random fraction along the start-goal
     line (within `along_jitter_fraction * length` of the midpoint), with a
     random perpendicular offset and a random size in `size_range`.
+
+    When `heightmap` is given, the obstacle's z is offset so its bottom
+    rests on the terrain surface at (x, y). Without this offset, obstacles
+    on heightmap terrains end up half-buried (centre at z = half-extent,
+    bottom at z = 0 ≪ terrain surface), which: (a) corrupts the visible
+    geometry the rover learns to dodge, (b) hides part of the collider so
+    the rover tunnels into the buried half before the broad-phase fires.
 
     Slots beyond `n_obstacles` are filled with the HIDE_Z sentinel so the
     pre-compiled geoms stay inert.
@@ -162,7 +350,13 @@ def sample_obstacles_along_path(
         along_x = sx + t * dx
         along_y = sy + t * dy
         perp = float(rng.uniform(-lateral_jitter, lateral_jitter))
-        positions.append((along_x + perp * lx, along_y + perp * ly, s))
+        ox = along_x + perp * lx
+        oy = along_y + perp * ly
+        # Place box centre at terrain_surface + half_extent so the box bottom
+        # rests on the surface. Flat-plane terrains pass `heightmap=None` →
+        # surface=0 → centre=s (the original behaviour).
+        surface_z = heightmap_height_at_xy(heightmap, heightmap_extent, ox, oy)
+        positions.append((ox, oy, surface_z + s))
         sizes.append((s, s, s))
 
     # Pad with hidden slots.

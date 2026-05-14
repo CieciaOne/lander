@@ -37,13 +37,21 @@ def _env_factory(terrain_name: str, max_steps: int = 500):
     return _make
 
 
-def _make_task(terrain_name: str, train_timesteps: int, eval_episodes: int, max_steps: int) -> Task:
+def _make_task(
+    terrain_name: str,
+    train_timesteps: int,
+    eval_episodes: int,
+    max_steps: int,
+    *,
+    ent_coef: float | None = None,
+) -> Task:
     return Task(
         terrain_name,
         _env_factory(terrain_name, max_steps),
         train_timesteps=train_timesteps,
         eval_episodes=eval_episodes,
         eval_max_steps=max_steps,
+        ent_coef=ent_coef,
     )
 
 
@@ -299,23 +307,39 @@ def scenario_10_robust_curriculum(
     an M3 Air, ~2-3 hours wall-clock. The final checkpoint
     (`ckpt_phase_8_after_RT_mixed.zip`) is the robust deployable model.
     """
-    phase_terrains = [
-        "RT_drive_random",
-        "RT_with_waypoint",
-        "RT_with_two_waypoints",
-        "RT_one_obstacle",
-        "RT_obstacle_field",
-        "RT_dense_obstacles",
-        "RT_gentle_hills",
-        "RT_dunes",
-        "RT_mixed",
+    # Per-phase plan: (terrain_id, budget_multiplier, ent_coef_override).
+    #
+    # Budget multipliers scale the CLI `train_timesteps`. Easy phases stay
+    # at base; obstacle phases get 2-3× because prior runs showed self-
+    # success well below convergence with a uniform budget (phase 5 was 0%
+    # on its own training task). Sum = 14× — `--train-steps 400000` ⇒ ~5.6
+    # M total env steps.
+    #
+    # `ent_coef` overrides PPO's entropy coefficient for that phase only.
+    # Obstacle phases 3-5 use 0.05 (5× the default) to keep the policy
+    # exploratory enough to climb out of the "freeze near start" local
+    # minimum that the reports flagged. `None` means "use the PPO default
+    # (0.01)".
+    phase_plan: list[tuple[str, float, float | None]] = [
+        ("RT_drive_random",       1.0, None),
+        ("RT_with_waypoint",      1.0, None),
+        ("RT_with_two_waypoints", 1.5, None),
+        ("RT_one_obstacle",       2.0, 0.05),
+        ("RT_obstacle_field",     2.0, 0.05),
+        ("RT_dense_obstacles",    2.5, 0.05),
+        ("RT_gentle_hills",       1.0, None),
+        ("RT_dunes",              1.0, None),
+        ("RT_mixed",              2.0, 0.02),
     ]
     cl_kwargs: dict = {"lam": ewc_lam} if cl_method == "ewc" else {}
     return Mission(
         name=f"scenario_10_robust_curriculum_{cl_method}",
         tasks=[
-            _make_task(t, train_timesteps, eval_episodes, max_steps)
-            for t in phase_terrains
+            _make_task(
+                t, int(train_timesteps * mult), eval_episodes, max_steps,
+                ent_coef=ec,
+            )
+            for t, mult, ec in phase_plan
         ],
         cl_method=cl_method,
         cl_kwargs=cl_kwargs,

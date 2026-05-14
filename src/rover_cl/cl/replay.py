@@ -72,24 +72,40 @@ class ReplayCL(BaseCLMethod):
         task_id: str,
         log_dir: Path | None = None,
         skip_post_train: bool = False,
+        callback=None,
+        ent_coef: float | None = None,
     ) -> None:
         self._ensure_model(env, log_dir)
         assert self.model is not None
 
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            reset_num_timesteps=False,
-            tb_log_name=f"replay_{task_id}",
-        )
-
-        # Rehearse on past tasks (anything saved BEFORE this task starts).
-        # We only rehearse if we have transitions from prior tasks — rehearsing on
-        # the current task before collection is a no-op.
+        # Rehearse on past tasks BEFORE PPO learning on the new task. The
+        # earlier ordering (rehearse-after) was an unforced bug for PPO:
+        # `_rehearse` runs pure behaviour-cloning gradient steps on stored
+        # past-task transitions, which moves the policy back toward past
+        # behaviour — desirable as a *task-boundary anchor*, destructive
+        # when applied *after* PPO has just finished tuning the policy for
+        # the new task. Order now is anchor → train → collect, so the
+        # checkpoint saved at end of phase is fully tuned for the current
+        # task, and past-task retention is supplied by the next phase's
+        # rehearsal pass (which will see this task in its buffer).
         past_ids = [tid for tid in self.buffers if tid != task_id]
         if past_ids:
             self._rehearse(past_ids)
         else:
             self.last_rehearsal_steps_run = 0
+
+        _ent_restore = None
+        if ent_coef is not None:
+            _ent_restore = float(self.model.ent_coef)
+            self.model.ent_coef = float(ent_coef)
+        self.model.learn(
+            total_timesteps=total_timesteps,
+            reset_num_timesteps=False,
+            tb_log_name=f"replay_{task_id}",
+            callback=callback,
+        )
+        if _ent_restore is not None:
+            self.model.ent_coef = _ent_restore
 
         if task_id not in self.seen_task_ids:
             self.seen_task_ids.append(task_id)

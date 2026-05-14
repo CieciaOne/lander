@@ -87,12 +87,20 @@ class BaseCLMethod:
         task_id: str,
         log_dir: Path | None = None,
         skip_post_train: bool = False,
+        callback: Any | None = None,
+        ent_coef: float | None = None,
     ) -> None:
         """Run PPO training on `env`. By default, the subclass should also call
         `self.post_train(env, task_id)` at the end (or call it itself). When
         `skip_post_train=True`, the subclass MUST skip that step; the Runner
         will call `post_train` separately on a single env after closing a
         (possibly multi-process) training VecEnv.
+
+        `callback` is forwarded to `model.learn(callback=...)` so the Runner
+        can attach an episode counter or any other SB3 callback.
+
+        `ent_coef` overrides the PPO entropy coefficient for this phase
+        only (subclasses should restore the prior value after `learn()`).
         """
         raise NotImplementedError
 
