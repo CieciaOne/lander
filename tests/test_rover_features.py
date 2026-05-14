@@ -257,7 +257,11 @@ def test_steering_actuators_drive_corner_joints() -> None:
     for ctrl_idx, _ in STEER_JOINTS:
         data.ctrl[ctrl_idx] = 0.5
 
-    for _ in range(200):
+    # 800 mj_steps = 4 s of sim time. The softer steer actuator (kp=400,
+    # forcerange=±150 — see assets/rover.xml comments) needs longer to
+    # settle than the old aggressive kp=600/fr=250 setup. Still trivial in
+    # wall-clock (~30 ms in the test suite).
+    for _ in range(800):
         mujoco.mj_step(model, data)
 
     for ctrl_idx, joint_name in STEER_JOINTS:

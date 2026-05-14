@@ -70,6 +70,23 @@ MAX_STEER_RAD = 1.0     # rad — corner steer angle at |steer|=1 (matches MJCF 
 TIP_OVER_COS = 0.5      # cos(angle from upright) below which we count as tipped
 GOAL_HOLD_STEPS = 5
 
+# Wheel body-frame positions (x_right, y_forward), derived from rover.xml.
+# `WHEELBASE` is the front-axle → rear-axle distance, used by the Ackermann
+# differential math in `step()`.
+# Order matches the `drive_*` actuator order set up in `__init__`:
+#   0: right_front, 1: right_middle, 2: right_rear,
+#   3: left_front,  4: left_middle,  5: left_rear.
+WHEEL_POS_BODY: tuple[tuple[float, float], ...] = (
+    (+0.85, +0.65),  # right_front
+    (+0.95, -0.05),  # right_middle (slightly more outboard than corners)
+    (+0.85, -0.75),  # right_rear
+    (-0.85, +0.65),  # left_front
+    (-0.95, -0.05),  # left_middle
+    (-0.85, -0.75),  # left_rear
+)
+WHEELBASE = 1.40
+REAR_AXLE_Y = -0.75  # body-frame y of the rear wheels (origin of the turn radius)
+
 
 @dataclass
 class EpisodeOutcome:
@@ -150,17 +167,29 @@ class RoverNavEnv(gym.Env):
         early_terminate_penalty: float | None = None,
         # Action smoothness penalty. Per step, scales the squared L2 norm
         # of (action_t - action_{t-1}). Max possible per step is 4 × 2 = 8
-        # (both action dims swing -1 → +1). The 0.05 scale caps the per-
-        # step penalty at -0.4 in the pathological case; typical run cost
-        # is ~10 over an episode. Damps the jagged "boogie woogie" paths
-        # seen in scenario_10 reports without overpowering the progress
-        # gradient.
-        action_jerk_scale: float = 0.05,
+        # (both action dims swing -1 → +1). Scaled at 0.1 the per-step
+        # cost caps at -0.8 in the pathological case — modest but
+        # consistent. Earlier 0.2 (with action filter alpha=0.3) over-
+        # damped exploration and stalled phase 0 learning; 0.1 is the
+        # 2× compromise that still shapes smoothness without freezing
+        # the policy at random init.
+        action_jerk_scale: float = 0.1,
         # Wheel-grounded penalty: -wheels_off_scale × n_wheels_off per step.
         # 6 wheels off (rover airborne) costs 0.18/step. Discourages
         # aggressive turns that lift the rocker-bogie clear of the ground.
         # Set to 0.0 to disable (e.g. on dunes where some lift is normal).
         wheels_off_scale: float = 0.03,
+        # First-order low-pass filter on the action before it reaches the
+        # MuJoCo actuators. alpha=1.0 means the filter is a no-op (commanded
+        # action goes straight to ctrl). Lower values smooth PPO's per-step
+        # noise but also damp early learning — at random init PPO outputs
+        # are mean-zero random samples, and a filter averages them to ~0,
+        # leaving the rover stationary and gradient-less. The PPO action
+        # smoothness signal is already covered by `action_jerk_scale`. Keep
+        # the filter machinery in place (set <1.0 if you want to experiment)
+        # but default to off after observing it killed exploration in
+        # scenario_10's first run with alpha=0.3.
+        action_filter_alpha: float = 1.0,
         # Adaptive time budget: when a waypoint is reached, extend `max_steps`
         # by `waypoint_time_bonus_per_metre * dist_to_next_target + waypoint_time_bonus_base`.
         # Lets episodes with widely-spaced targets actually finish without
@@ -200,6 +229,7 @@ class RoverNavEnv(gym.Env):
         self.stuck_in_collision_penalty = stuck_in_collision_penalty
         self.action_jerk_scale = action_jerk_scale
         self.wheels_off_scale = wheels_off_scale
+        self.action_filter_alpha = float(np.clip(action_filter_alpha, 0.0, 1.0))
         self.waypoint_time_bonus_per_metre = waypoint_time_bonus_per_metre
         self.waypoint_time_bonus_base = waypoint_time_bonus_base
         self.render_mode = render_mode
@@ -614,25 +644,64 @@ class RoverNavEnv(gym.Env):
         # Action smoothness: previous step's action, used by the jerk penalty.
         # First step has no prior action; init to zero (no penalty on step 1).
         self._prev_action = np.zeros(2, dtype=np.float64)
+        # First-order action filter state. The filter outputs what the
+        # actuators actually see — `_filtered_action` lags behind `action`,
+        # smoothing PPO's step-to-step noise.
+        self._filtered_action = np.zeros(2, dtype=np.float64)
         obs = self._build_obs()
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        # `action` is what PPO commanded this step; `_filtered_action` is
+        # what the actuators actually see after the low-pass filter. Jerk
+        # penalty is computed on the RAW command (so the policy is taught
+        # to issue smooth commands), not on the filtered value — penalising
+        # the filtered signal would be a tautology, since the filter is
+        # designed to suppress jerk.
         action = np.clip(action, -1.0, 1.0).astype(np.float64)
-        # Action-jerk penalty: squared L2 of the action change since last
-        # step. Computed up-front so we can stash `_prev_action` cleanly
-        # at the end.
         action_jerk_sq = float(np.sum((action - self._prev_action) ** 2))
         action_jerk_penalty = self.action_jerk_scale * action_jerk_sq
-        throttle = float(action[0])
-        steer    = float(action[1])
-        # All 6 drive wheels at the same speed. positive ctrl rolls -Y so we
-        # negate to make "throttle > 0 => +Y forward" the user-facing convention.
-        wheel_cmd = -throttle * MAX_WHEEL_VEL
-        self._data.ctrl[0:6] = wheel_cmd
+
+        # First-order LPF: filtered_t = alpha · cmd + (1-alpha) · filtered_{t-1}.
+        # Tests + the visualiser use alpha=0.3 by default.
+        a = self.action_filter_alpha
+        self._filtered_action = a * action + (1.0 - a) * self._filtered_action
+        throttle = float(self._filtered_action[0])
+        steer    = float(self._filtered_action[1])
+
+        # Per-wheel Ackermann differential. Each wheel's commanded angular
+        # velocity scales with its distance from the instant centre of rotation
+        # (ICR). Without this, every wheel runs at the same speed: the inner
+        # wheels scrub sideways during turns, the lateral scrub force
+        # articulates the rocker-bogie, and the middle wheel lifts off — the
+        # "boogie woogie" symptom. With it, inner-side wheels run slower than
+        # outer-side ones and the chassis pivots cleanly.
+        #
+        # Geometry: with front-wheel steer δ, the ICR sits at body-frame
+        # (R_x, REAR_AXLE_Y) where R_x = WHEELBASE / tan(δ). Each wheel at
+        # (x_w, y_w) has distance from ICR r_w = √((x_w − R_x)² + (y_w − y_rear)²);
+        # its velocity scales as r_w / |R_x|. We then divide by the maximum
+        # multiplier so the fastest wheel hits the user-commanded base velocity
+        # rather than clipping at the actuator's ±MAX_WHEEL_VEL limit — that
+        # preserves the differential ratio across the entire steer range.
+        v_base = -throttle * MAX_WHEEL_VEL  # ctrl sign: positive rolls -Y
+        steer_rad = steer * MAX_STEER_RAD
+        if abs(steer_rad) < 1e-3:
+            self._data.ctrl[0:6] = v_base
+        else:
+            R = WHEELBASE / np.tan(steer_rad)
+            R_abs = abs(R)
+            mults = np.empty(6)
+            for i, (xw, yw) in enumerate(WHEEL_POS_BODY):
+                mults[i] = np.hypot(xw - R, yw - REAR_AXLE_Y) / R_abs
+            max_mult = float(mults.max())
+            if max_mult > 1.0:
+                mults /= max_mult
+            self._data.ctrl[0:6] = v_base * mults
+
         # 4-wheel Ackermann counter-steer (matches drive_ackermann in the viewer):
         # steer > 0 turns CW (right). Fronts go -steer, rears go +steer.
-        steer_cmd = steer * MAX_STEER_RAD
+        steer_cmd = steer_rad
         # Actuator order: 6=right_front, 7=right_rear, 8=left_front, 9=left_rear.
         self._data.ctrl[6] = -steer_cmd  # right front
         self._data.ctrl[7] = +steer_cmd  # right rear
@@ -796,6 +865,7 @@ class RoverNavEnv(gym.Env):
             "distance_to_goal": dist_to_goal,
             "distance_to_target": dist,
             "waypoint_index": self._wp_idx,
+            "goal_hold": int(self._goal_hold),
             "is_success": bool(success),
             "collision": bool(collision),
             "tipped": bool(tipped),
@@ -804,6 +874,27 @@ class RoverNavEnv(gym.Env):
             "pos_xy": (float(pos_xy[0]), float(pos_xy[1])),
             "yaw": float(yaw_now),
             "n_wheels_off_ground": int(n_wheels_off),
+            # Per-step reward decomposition. Positive numbers add to the
+            # step reward, negative subtract. Sum equals `reward` for this
+            # step. Used by the viewer to surface "why did the rover stop
+            # before the goal?" without re-running the env in debug mode.
+            "reward_terms": {
+                "progress": float(self.progress_reward_scale * progress),
+                "step_cost": float(-self.step_cost),
+                "proximity": float(-proximity_penalty),
+                "collision": float(-(self.collision_penalty if collision else 0.0)),
+                "hit": float(-(self.hit_penalty if new_hit else 0.0)),
+                "tipped": float(-(self.tipped_penalty if tipped else 0.0)),
+                "stuck_in_collision": float(-(self.stuck_in_collision_penalty
+                                              if stuck_in_collision and not success else 0.0)),
+                "stuck_no_progress": float(-(self.stuck_no_progress_penalty
+                                             if stuck_no_progress and not success else 0.0)),
+                "action_jerk": float(-action_jerk_penalty),
+                "wheels_off": float(-wheels_off_penalty),
+                "waypoint_bonus": float(waypoint_reached_bonus),
+                "speed_bonus": float(speed_bonus),
+                "goal_bonus": float(self.goal_bonus if success else 0.0),
+            },
         }
         if terminated or truncated:
             info["episode"] = EpisodeOutcome(

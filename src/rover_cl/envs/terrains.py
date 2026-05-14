@@ -20,9 +20,12 @@ from rover_cl.envs.randomization import (
     HIDE_Z,
     TerrainRandomizer,
     TerrainRoll,
+    sample_arc_waypoints,
     sample_obstacles_along_path,
+    sample_slalom_waypoints,
     sample_start_goal_pair,
     sample_twisty_waypoints,
+    sample_waypoint_at_bearing,
     sample_waypoints_between,
 )
 
@@ -701,6 +704,140 @@ def terrain_RT_with_two_waypoints(seed: int = 0) -> TerrainSpec:
 _NO_OBSTACLE_PROB = 0.20  # fraction of episodes that get zero obstacles
 
 
+# ---------------------------------------------------------------------------
+# Navigation-skill curriculum (no obstacles). Each terrain trains ONE specific
+# manoeuvre — arc steering, sharp 90° turn, U-turn, slalom. Used before the
+# obstacle-avoidance phases so the policy enters those with a solid driving
+# foundation. Bounded randomisation per phase: layout pattern is fixed (e.g.
+# "2 waypoints on an arc"), specifics (arc angle, start orientation, start
+# and goal positions) vary per episode.
+# ---------------------------------------------------------------------------
+
+
+def terrain_RT_waypoints_arc(seed: int = 0) -> TerrainSpec:
+    """Phase: 2 waypoints arranged along an arc bulging off the start→goal line.
+
+    Arc sweep is uniform in 30°–90° per episode. Tests "lay your steering
+    into a curve" — every waypoint sits at the same arc radius, so a single
+    well-chosen steer angle should trace through all of them.
+    """
+    spec = _flat_template("RT_waypoints_arc", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
+        )
+        wps = sample_arc_waypoints(
+            rng, start, goal, n_waypoints=2, arc_angle_deg=(30.0, 90.0),
+        )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal,
+            waypoints=wps,
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RT_waypoint_90(seed: int = 0) -> TerrainSpec:
+    """Phase: 1 waypoint at ~90° from the rover's starting heading.
+
+    Two waypoints total: the 90°-turn waypoint, then the final goal beyond
+    it (in roughly the post-turn direction). Trains sharp directional
+    changes from rest. Sign (left vs right) is randomised per episode.
+    """
+    spec = _flat_template("RT_waypoint_90", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, _goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=5.0, margin=2.0,
+        )
+        wp = sample_waypoint_at_bearing(
+            rng, start, yaw,
+            relative_bearing_range=(np.deg2rad(75), np.deg2rad(105)),
+            distance_range=(4.0, 6.0),
+            arena_half=12.0, margin=2.0,
+        )
+        # Goal: roughly in the post-turn direction from the waypoint.
+        # Use the waypoint's relative bearing from start to find the turn
+        # direction, then extrapolate.
+        dx, dy = wp[0] - start[0], wp[1] - start[1]
+        # Project further along that vector for the final goal.
+        goal_dist = float(rng.uniform(3.0, 5.0))
+        norm = (dx * dx + dy * dy) ** 0.5
+        bound = 12.0 - 2.0
+        gx = float(np.clip(wp[0] + goal_dist * dx / norm, -bound, bound))
+        gy = float(np.clip(wp[1] + goal_dist * dy / norm, -bound, bound))
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=(gx, gy),
+            waypoints=(wp,),
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RT_waypoint_180(seed: int = 0) -> TerrainSpec:
+    """Phase: 1 waypoint behind the rover, forcing a near-U-turn.
+
+    Bearing uniform in 135°–180° relative to start yaw. Trains the rover
+    to reorient when the target is behind it from rest.
+    """
+    spec = _flat_template("RT_waypoint_180", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, _ = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=5.0, margin=2.0,
+        )
+        wp = sample_waypoint_at_bearing(
+            rng, start, yaw,
+            relative_bearing_range=(np.deg2rad(135), np.deg2rad(180)),
+            distance_range=(4.0, 7.0),
+            arena_half=12.0, margin=2.0,
+        )
+        # Goal further along same vector.
+        dx, dy = wp[0] - start[0], wp[1] - start[1]
+        norm = (dx * dx + dy * dy) ** 0.5
+        goal_dist = float(rng.uniform(3.0, 5.0))
+        bound = 12.0 - 2.0
+        gx = float(np.clip(wp[0] + goal_dist * dx / norm, -bound, bound))
+        gy = float(np.clip(wp[1] + goal_dist * dy / norm, -bound, bound))
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=(gx, gy),
+            waypoints=(wp,),
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RT_slalom(seed: int = 0) -> TerrainSpec:
+    """Phase: 4-5 alternating-side waypoints in an S-curve / slalom pattern.
+
+    Fixed-side alternation (left-right-left…), randomised swing magnitude
+    and starting side per episode. Trains rhythmic steering reversals
+    — the rover learns to plan one segment ahead.
+    """
+    spec = _flat_template("RT_slalom", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=9.0, margin=2.0,
+        )
+        n_wp = int(rng.integers(4, 6))  # 4 or 5
+        wps = sample_slalom_waypoints(
+            rng, start, goal, n_waypoints=n_wp,
+            swing_min=1.8, swing_max=3.0,
+        )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal,
+            waypoints=wps,
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
 def terrain_RT_one_obstacle(seed: int = 0) -> TerrainSpec:
     """Phase 3: random start/goal with up to one random obstacle in the path.
 
@@ -906,6 +1043,10 @@ TERRAIN_CATALOG: dict[str, TerrainFactory] = {
     "RT_drive_random": terrain_RT_drive_random,
     "RT_with_waypoint": terrain_RT_with_waypoint,
     "RT_with_two_waypoints": terrain_RT_with_two_waypoints,
+    "RT_waypoints_arc": terrain_RT_waypoints_arc,
+    "RT_waypoint_90": terrain_RT_waypoint_90,
+    "RT_waypoint_180": terrain_RT_waypoint_180,
+    "RT_slalom": terrain_RT_slalom,
     "RT_one_obstacle": terrain_RT_one_obstacle,
     "RT_obstacle_field": terrain_RT_obstacle_field,
     "RT_dense_obstacles": terrain_RT_dense_obstacles,

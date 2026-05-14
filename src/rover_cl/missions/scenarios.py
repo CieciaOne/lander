@@ -320,10 +320,19 @@ def scenario_10_robust_curriculum(
     # exploratory enough to climb out of the "freeze near start" local
     # minimum that the reports flagged. `None` means "use the PPO default
     # (0.01)".
+    # Navigation-skill phases (1-6) come BEFORE the obstacle phases so the
+    # rover enters obstacle training already knowing how to chase a
+    # waypoint, lay into an arc, do a 90° turn, do a U-turn, and slalom.
+    # Phases 7-9: obstacle ramp (one → field → dense). Phases 10-11: terrain
+    # (hills → dunes). Phase 12: mixed-everything capstone.
     phase_plan: list[tuple[str, float, float | None]] = [
         ("RT_drive_random",       1.0, None),
         ("RT_with_waypoint",      1.0, None),
-        ("RT_with_two_waypoints", 1.5, None),
+        ("RT_with_two_waypoints", 1.0, None),
+        ("RT_waypoints_arc",      1.0, None),
+        ("RT_waypoint_90",        1.0, None),
+        ("RT_waypoint_180",       1.0, None),
+        ("RT_slalom",             1.5, None),
         ("RT_one_obstacle",       2.0, 0.05),
         ("RT_obstacle_field",     2.0, 0.05),
         ("RT_dense_obstacles",    2.5, 0.05),

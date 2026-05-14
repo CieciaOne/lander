@@ -305,6 +305,122 @@ def sample_twisty_waypoints(
     return tuple(out)
 
 
+def sample_arc_waypoints(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    goal: tuple[float, float],
+    n_waypoints: int = 2,
+    arc_angle_deg: tuple[float, float] = (30.0, 90.0),
+) -> tuple[tuple[float, float], ...]:
+    """Place `n_waypoints` along an arc that bulges off the start→goal line.
+
+    The arc's chord runs from start to goal; its angular sweep is drawn
+    uniformly from `arc_angle_deg`. The bulge direction (left/right of the
+    line) is random per call. Useful for training "lay your steering into a
+    curve" — every waypoint sits at the same arc radius, so a single
+    well-chosen steer angle traces them all.
+    """
+    sx, sy = start
+    gx, gy = goal
+    dx, dy = gx - sx, gy - sy
+    chord = (dx * dx + dy * dy) ** 0.5
+    if chord < 1e-6 or n_waypoints <= 0:
+        return ()
+    mx, my = (sx + gx) / 2, (sy + gy) / 2
+    # Forward (chord direction) and perpendicular unit vectors.
+    fx, fy = dx / chord, dy / chord
+    lx, ly = -fy, fx
+    # Pick the arc's angular sweep and bulge side.
+    sweep = float(np.deg2rad(rng.uniform(*arc_angle_deg)))
+    side = 1.0 if rng.uniform() < 0.5 else -1.0
+    # Geometry: chord subtends `sweep` at the arc's centre. Radius R from
+    # R = (chord/2) / sin(sweep/2). Centre lies on the perpendicular
+    # bisector at distance d = (chord/2) / tan(sweep/2) from the chord.
+    half_chord = chord / 2.0
+    R = half_chord / np.sin(sweep / 2.0)
+    d_centre = half_chord / np.tan(sweep / 2.0)
+    cx = mx - side * d_centre * lx
+    cy = my - side * d_centre * ly
+    # Angle from centre to start, to goal.
+    a_start = float(np.arctan2(sy - cy, sx - cx))
+    # Walk in the side direction so waypoints sit ON the arc between start and goal.
+    # Sweep angle from start toward goal is `+sweep * side` in arc-centre frame.
+    out: list[tuple[float, float]] = []
+    for i in range(n_waypoints):
+        t = (i + 1) / (n_waypoints + 1)
+        a = a_start + side * t * sweep
+        out.append((cx + R * np.cos(a), cy + R * np.sin(a)))
+    return tuple(out)
+
+
+def sample_waypoint_at_bearing(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    start_yaw: float,
+    relative_bearing_range: tuple[float, float],
+    distance_range: tuple[float, float],
+    arena_half: float,
+    margin: float = 1.5,
+) -> tuple[float, float]:
+    """Sample one waypoint at a target relative bearing in [lo, hi] (radians).
+
+    Used to construct "90° turn", "180° U-turn", etc. terrains where the
+    rover must turn through a specific angle to chase the waypoint. The
+    bearing is measured in the rover's body frame; sign is randomised so
+    left- and right-turn episodes are balanced.
+    """
+    lo, hi = relative_bearing_range
+    sign = 1.0 if rng.uniform() < 0.5 else -1.0
+    rel_b = sign * float(rng.uniform(lo, hi))
+    # Rover forward in world: +Y after yaw rotation.
+    world_b = start_yaw + np.pi / 2 + rel_b
+    bound = arena_half - margin
+    for _ in range(40):
+        d = float(rng.uniform(*distance_range))
+        wx = start[0] + d * float(np.cos(world_b))
+        wy = start[1] + d * float(np.sin(world_b))
+        if abs(wx) <= bound and abs(wy) <= bound:
+            return (wx, wy)
+    # Fall back to a point in the same direction at the minimum distance.
+    d = distance_range[0]
+    return (float(np.clip(start[0] + d * np.cos(world_b), -bound, bound)),
+            float(np.clip(start[1] + d * np.sin(world_b), -bound, bound)))
+
+
+def sample_slalom_waypoints(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    goal: tuple[float, float],
+    n_waypoints: int = 5,
+    swing_min: float = 1.8,
+    swing_max: float = 3.0,
+) -> tuple[tuple[float, float], ...]:
+    """Strict alternating-side waypoints with deterministic spacing.
+
+    Same idea as `sample_twisty_waypoints` but with fixed alternation
+    (always left-right-left-…), uniform spacing, and tighter swing range.
+    Used by the slalom terrain — the rover learns a steady S-curve.
+    """
+    sx, sy = start
+    gx, gy = goal
+    dx, dy = gx - sx, gy - sy
+    length = (dx * dx + dy * dy) ** 0.5
+    if length < 1e-6 or n_waypoints <= 0:
+        return ()
+    fx, fy = dx / length, dy / length
+    lx, ly = -fy, fx
+    side = 1.0 if rng.uniform() < 0.5 else -1.0
+    out: list[tuple[float, float]] = []
+    for i in range(n_waypoints):
+        t = (i + 1) / (n_waypoints + 1)
+        along_x = sx + t * dx
+        along_y = sy + t * dy
+        magnitude = float(rng.uniform(swing_min, swing_max))
+        out.append((along_x + side * magnitude * lx, along_y + side * magnitude * ly))
+        side = -side
+    return tuple(out)
+
+
 def sample_obstacles_along_path(
     rng: np.random.Generator,
     start: tuple[float, float],

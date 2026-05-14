@@ -25,8 +25,12 @@
     <default class="wheel">
       <!-- Friction tuned for both grip (so the corner wheels can spin the rover in
            place against middle-wheel scrub) and stability (so the chassis CoM is
-           low enough to absorb the lateral scrub torque without lifting wheels). -->
-      <geom type="cylinder" rgba="0.15 0.15 0.18 1" friction="1.8 0.1 0.01"/>
+           low enough to absorb the lateral scrub torque without lifting wheels).
+           Size 0.22 r × 0.12 half-thickness was reduced from 0.25 × 0.16 so
+           neighbouring wheels on the same side don't visually collide with the
+           narrower track (front/rear at x=±0.85, middle at ±0.95). -->
+      <geom type="cylinder" rgba="0.15 0.15 0.18 1" friction="1.8 0.1 0.01"
+            size="0.22 0.12"/>
     </default>
     <default class="arm">
       <!-- density 300 keeps arm bodies light (~0.4–0.8 kg each) without explicit inertials -->
@@ -45,7 +49,15 @@
     <default class="steer">
       <!-- Position-controlled steering: ctrl = desired joint angle (rad).
            ±1 rad ≈ ±57°, enough for general nav; real Curiosity goes to ±90° for K-turns. -->
-      <position kp="600" kv="30" ctrlrange="-1.0 1.0" forcerange="-250 250"/>
+      <!-- Softer steer than the old kp=600/forcerange=250 setup. The old gains
+           slammed the corner knuckles to position in a single physics step,
+           which read in the viewer as "wheels rotating left/right rapidly"
+           when PPO oscillated the steer command. With kp=300 + forcerange
+           ±100 the steer follows commands over several physics steps —
+           visually smooth, and the env-level action filter (alpha=0.3 in
+           RoverNavEnv.step) further softens the ctrl input before it
+           reaches this actuator. -->
+      <position kp="400" kv="30" ctrlrange="-1.0 1.0" forcerange="-150 150"/>
     </default>
     <default class="armjoint">
       <!-- Position-controlled arm joint: ctrl = desired angle (rad). -->
@@ -111,14 +123,16 @@
         </body>
       </body>
 
-      <!-- Right rocker. Pivots at the chassis side. The arms extend OUTBOARD and
-           slightly DOWN to the steering knuckles, which sit ABOVE the wheel tops.
-           A vertical strut drops from each knuckle through the wheel hub down to
-           the axle (the strut visually traverses the wheel silhouette like a real
-           rover's steering housing). The steering Z axis passes through the wheel
-           center → zero scrub radius. The middle wheels have no steering joint;
-           they hang from a rigid vertical stub on the bogie. Suspension geoms use
-           contype=0 so the rigid skeleton links don't self-collide. -->
+      <!-- Right rocker. Pivots at the chassis side. The arms extend OUTBOARD
+           and slightly DOWN to the steering knuckles, which sit ABOVE the
+           wheel tops. Outboard offset of 0.45 m matches the silhouette of
+           Curiosity / Perseverance, where the wheels sit well outside the
+           chassis profile (track ≈ 2× chassis width). A vertical strut drops
+           from each knuckle through the wheel hub down to the axle. The
+           steering Z axis passes through the wheel center → zero scrub
+           radius. The middle wheels have no steering joint; they hang from a
+           rigid vertical stub on the bogie. Suspension geoms use contype=0
+           so the rigid skeleton links don't self-collide. -->
       <body name="rocker_right" pos="0.65 0.10 0.10">
         <!-- Rocker pivot. PASSIVE per real Curiosity / Perseverance — no springs,
              no controllers, only low bearing friction (damping≈2). The articulation
@@ -126,55 +140,70 @@
              coupled by the differential equality below the worldbody. -->
         <joint name="rocker_right_joint" axis="1 0 0" range="-0.44 0.44"
                damping="2" stiffness="0"/>
-        <!-- Front arm: extends outboard (+x, +0.16) and forward (+y, +0.55) with
-             a slight downward bend (-0.05) so the arm tip sits just above wheel top. -->
-        <geom class="rocker" type="cylinder" fromto="0 0 0  0.16 0.55 -0.35" size="0.04"
+        <!-- Front arm: outboard (+x 0.20) + forward (+y 0.55), shallow ~22°
+             drop. Front wheel x = 0.65 + 0.20 = ±0.85 m. Pulled in vs the
+             rear-arm bogie pivot (x=±0.95) so the corner wheels don't
+             clip middle wheels when steering at max angle. -->
+        <geom class="rocker" type="cylinder" fromto="0 0 0  0.20 0.55 -0.22" size="0.04"
               contype="0" conaffinity="0"/>
-        <!-- Rear arm to bogie pivot: outboard + back, also slight down bend. -->
-        <geom class="rocker" type="cylinder" fromto="0 0 0  0.16 -0.50 -0.15" size="0.04"
+        <!-- Rear arm to bogie pivot: outboard (+x 0.25) + back (-y 0.50),
+             nearly horizontal (-0.02 drop). Bogie pivot at x=±0.90, tucked
+             slightly inboard from the previous ±0.95 — it now sits between
+             the middle (±0.95) and rear (±0.85) wheel tracks rather than
+             flush with the middle wheel. -->
+        <geom class="rocker" type="cylinder" fromto="0 0 0  0.25 -0.50 -0.02" size="0.04"
               contype="0" conaffinity="0"/>
 
-        <body name="steer_right_front" pos="0.16 0.55 -0.35">
+        <body name="steer_right_front" pos="0.20 0.55 -0.22">
           <joint name="steer_right_front_joint" axis="0 0 1" range="-1.0 1.0"
                  damping="20" stiffness="0"/>
           <!-- Vertical steering strut from knuckle (above wheel top) down to axle. -->
           <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
                 contype="0" conaffinity="0"/>
-          <body name="wheel_right_front" pos="0 0 -0.25">
+          <body name="wheel_right_front" pos="0 0 -0.28">
             <joint name="wheel_right_front_joint" axis="1 0 0"/>
-            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
-            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+            <geom class="wheel" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
         </body>
 
-        <body name="bogie_right" pos="0.16 -0.50 -0.15">
+        <body name="bogie_right" pos="0.25 -0.50 -0.02">
+          <!-- Light spring (stiffness=10) added to centre the bogie under load.
+               Real Curiosity/Perseverance bogies are truly passive (stiffness=0)
+               but in simulation that lets the middle wheel lift away from the
+               ground during lateral-scrub turns. The spring is small enough
+               that the suspension still articulates over terrain features
+               but pushes the bogie back to neutral within ~1 s once the
+               scrub force goes away. -->
           <joint name="bogie_right_joint" axis="1 0 0" range="-0.35 0.35"
-                 damping="8" stiffness="0"/>
-          <!-- Λ-shaped bogie: pivot at top, arms drop down-forward and down-back.
-               The middle-wheel strut is a geom of the bogie (NOT the wheel) so it
-               stays still while the wheel rolls. -->
-          <geom class="rocker" type="cylinder" fromto="0 0 0 0 0.35 -0.20" size="0.035"
+                 damping="8" stiffness="10" springref="0"/>
+          <!-- Λ-shaped bogie. Pivot is body-rel x=0.90 (rocker_x 0.65 +
+               bogie_offset 0.25). Front arm tilts OUTWARD by 0.05 in
+               body-frame x so the middle wheel sits at world x=±0.95;
+               rear arm tilts INWARD by 0.05 so the rear wheel sits at
+               world x=±0.85 (matching the front-wheel track). -->
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0.05 0.35 -0.20" size="0.035"
                 contype="0" conaffinity="0"/>
-          <geom class="rocker" type="cylinder" fromto="0 0 0 0 -0.35 -0.20" size="0.035"
+          <geom class="rocker" type="cylinder" fromto="0 0 0 -0.05 -0.35 -0.20" size="0.035"
                 contype="0" conaffinity="0"/>
-          <geom class="rocker" type="cylinder" fromto="0 0.35 -0.20 0 0.35 -0.45" size="0.035"
+          <geom class="rocker" type="cylinder" fromto="0.05 0.35 -0.20 0.05 0.35 -0.45" size="0.035"
                 contype="0" conaffinity="0"/>
 
-          <body name="wheel_right_middle" pos="0 0.35 -0.45">
+          <body name="wheel_right_middle" pos="0.05 0.35 -0.48">
             <joint name="wheel_right_middle_joint" axis="1 0 0"/>
-            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
-            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+            <geom class="wheel" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
 
-          <body name="steer_right_rear" pos="0 -0.35 -0.20">
+          <body name="steer_right_rear" pos="-0.05 -0.35 -0.20">
             <joint name="steer_right_rear_joint" axis="0 0 1" range="-1.0 1.0"
                    damping="20" stiffness="0"/>
             <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
                   contype="0" conaffinity="0"/>
-            <body name="wheel_right_rear" pos="0 0 -0.25">
+            <body name="wheel_right_rear" pos="0 0 -0.28">
               <joint name="wheel_right_rear_joint" axis="1 0 0"/>
-              <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
-              <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+              <geom class="wheel" euler="0 1.5707963 0"/>
+              <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
             </body>
           </body>
         </body>
@@ -184,48 +213,53 @@
       <body name="rocker_left" pos="-0.65 0.10 0.10">
         <joint name="rocker_left_joint" axis="1 0 0" range="-0.44 0.44"
                damping="2" stiffness="0"/>
-        <geom class="rocker" type="cylinder" fromto="0 0 0  -0.16 0.55 -0.35" size="0.04"
+        <geom class="rocker" type="cylinder" fromto="0 0 0  -0.20 0.55 -0.22" size="0.04"
               contype="0" conaffinity="0"/>
-        <geom class="rocker" type="cylinder" fromto="0 0 0  -0.16 -0.50 -0.15" size="0.04"
+        <geom class="rocker" type="cylinder" fromto="0 0 0  -0.25 -0.50 -0.02" size="0.04"
               contype="0" conaffinity="0"/>
 
-        <body name="steer_left_front" pos="-0.16 0.55 -0.35">
+        <body name="steer_left_front" pos="-0.20 0.55 -0.22">
           <joint name="steer_left_front_joint" axis="0 0 1" range="-1.0 1.0"
                  damping="20" stiffness="0"/>
           <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
                 contype="0" conaffinity="0"/>
-          <body name="wheel_left_front" pos="0 0 -0.25">
+          <body name="wheel_left_front" pos="0 0 -0.28">
             <joint name="wheel_left_front_joint" axis="1 0 0"/>
-            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
-            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+            <geom class="wheel" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
         </body>
 
-        <body name="bogie_left" pos="-0.16 -0.50 -0.15">
+        <body name="bogie_left" pos="-0.25 -0.50 -0.02">
+          <!-- Light spring (stiffness=10); see bogie_right for rationale. -->
           <joint name="bogie_left_joint" axis="1 0 0" range="-0.35 0.35"
-                 damping="8" stiffness="0"/>
-          <geom class="rocker" type="cylinder" fromto="0 0 0 0 0.35 -0.20" size="0.035"
+                 damping="8" stiffness="10" springref="0"/>
+          <!-- Front arm tilts OUTWARD (-x for the left side) by 0.05 so the
+               middle wheel sits at x=-0.95; rear arm tilts INWARD (+x for
+               the left side) by 0.05 so the rear wheel sits at x=-0.85,
+               matching the front-wheel track. -->
+          <geom class="rocker" type="cylinder" fromto="0 0 0 -0.05 0.35 -0.20" size="0.035"
                 contype="0" conaffinity="0"/>
-          <geom class="rocker" type="cylinder" fromto="0 0 0 0 -0.35 -0.20" size="0.035"
+          <geom class="rocker" type="cylinder" fromto="0 0 0 0.05 -0.35 -0.20" size="0.035"
                 contype="0" conaffinity="0"/>
-          <geom class="rocker" type="cylinder" fromto="0 0.35 -0.20 0 0.35 -0.45" size="0.035"
+          <geom class="rocker" type="cylinder" fromto="-0.05 0.35 -0.20 -0.05 0.35 -0.45" size="0.035"
                 contype="0" conaffinity="0"/>
 
-          <body name="wheel_left_middle" pos="0 0.35 -0.45">
+          <body name="wheel_left_middle" pos="-0.05 0.35 -0.48">
             <joint name="wheel_left_middle_joint" axis="1 0 0"/>
-            <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
-            <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+            <geom class="wheel" euler="0 1.5707963 0"/>
+            <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
 
-          <body name="steer_left_rear" pos="0 -0.35 -0.20">
+          <body name="steer_left_rear" pos="0.05 -0.35 -0.20">
             <joint name="steer_left_rear_joint" axis="0 0 1" range="-1.0 1.0"
                    damping="20" stiffness="0"/>
             <geom class="rocker" type="cylinder" fromto="0 0 0 0 0 -0.25" size="0.04"
                   contype="0" conaffinity="0"/>
-            <body name="wheel_left_rear" pos="0 0 -0.25">
+            <body name="wheel_left_rear" pos="0 0 -0.28">
               <joint name="wheel_left_rear_joint" axis="1 0 0"/>
-              <geom class="wheel" size="0.25 0.16" euler="0 1.5707963 0"/>
-              <inertial pos="0 0 0" mass="1.5" diaginertia="0.047 0.036 0.036"/>
+              <geom class="wheel" euler="0 1.5707963 0"/>
+              <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
             </body>
           </body>
         </body>

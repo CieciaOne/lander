@@ -57,7 +57,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 # Geometry constants
-WHEEL_RADIUS = 0.25
+WHEEL_RADIUS = 0.22
 CORNER_RIGHT_FRONT = (0.65, 0.65)
 CORNER_RIGHT_REAR  = (0.65, -0.75)
 CORNER_LEFT_FRONT  = (-0.65, 0.65)
