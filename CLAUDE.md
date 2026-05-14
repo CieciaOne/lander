@@ -168,6 +168,12 @@ python scripts/run_scenario.py scenario_01_sequential_terrains --cl-method repla
 # Fisher/buffer collection on a single fresh env after PPO learning finishes.
 python scripts/run_scenario.py scenario_07_blocked_arc --cl-method naive --train-steps 500000 --n-envs 4 --seed 0
 
+# MJX (GPU): batch N envs in a single JAX process. On a 3060Ti N=512+ is
+# comfortable. --mjx-impl warp enables Nvidia's MuJoCo-Warp pipeline for
+# extra collision pairs (requires pip install nvidia-warp on Linux+CUDA).
+python scripts/run_scenario.py scenario_07_blocked_arc --cl-method naive \
+    --train-steps 500000 --n-envs 512 --backend mjx --seed 0
+
 # After running multiple methods, write a comparison bar chart:
 python scripts/run_scenario.py scenario_01_sequential_terrains --compare
 
@@ -194,6 +200,7 @@ Whole suite runs in ~10 s. Real research runs go via `scripts/run_scenario.py`, 
 
 - **PPO defaults** (`cl/base.py::DEFAULT_PPO_KWARGS`): `n_steps=2048`, `batch_size=128`, `learning_rate=3e-4`, `gamma=0.995` (effective horizon ≈ 200 steps, so a +50 goal bonus at step 500 backprops as ≈ +4 at step 0), `ent_coef=0.01` (keeps the policy stochastic during training so it doesn't collapse to a "drive forward and freeze" optimum), `policy_kwargs.net_arch=[128, 128]`.
 - **Parallel rollouts** (`--n-envs N`): `Runner` builds a `SubprocVecEnv` of N `Monitor`-wrapped envs for PPO learning. EWC/replay's post-training data collection still uses a single fresh env via the new `cl.post_train(env, task_id)` hook — `train_on(env, ..., skip_post_train=True)` is the boundary. M3 Air (8 logical CPUs) sweet spot is `--n-envs 4`–`6`; bigger gives diminishing returns. NN compute on MPS / Neural Engine is **not** a win for the [128, 128] MLP — kernel-launch overhead exceeds savings; CPU + Accelerate BLAS is the right backend.
+- **MJX backend** (`--backend mjx`): GPU-accelerated rollouts via MuJoCo XLA. One process, `--n-envs N` rovers run in parallel under a single `jit(vmap(...))` compile. Designed for Linux + CUDA (e.g. 3060 Ti); on Mac CPU JAX it works but is slower than the SubprocVecEnv path. `--mjx-impl warp` flips to the Nvidia MuJoCo-Warp backend on supported hardware (requires `pip install nvidia-warp`). Module: `rover_cl/envs/nav_mjx.py` (jitted env) + `rover_cl/envs/mjx_vec_env.py` (SB3 VecEnv adapter). The MJX path bakes ONE `randomize_on_reset` roll into the model at instance creation (per-env variation comes from a pre-sampled spawn/target pool, not per-reset rerolls), and uses a sphere collision shape inside each wheel body (cylinder is visual-only) because MJX doesn't support cylinder-{box, hfield, mesh}. The CPU path is unaffected.
 - **Evaluation** writes a per-(phase, eval-task) **top-down report PNG** alongside `results.json` and checkpoints. Each report shows: terrain (with hfield rendered as `gist_earth` underlay when present), obstacles with drop-shadows, start / waypoints / goal with halos, all 10 eval trajectories speed-coloured via `LineCollection` + `magma` colormap, contact positions as red Xs, plus an info sidebar with success rate %, outcome tiles, and per-row averaged metrics. See `docs/design/evaluation.md`.
 - **Thesis plot style** is applied at import time in `viz/plots.py::_apply_thesis_style` — serif body, dropped top/right spines, soft grid, 200 DPI saves, 8-colour curated palette. All plots (`plot_retention_matrix`, `plot_retention_curves`, `plot_method_comparison_with_variance`, `plot_run_report`) share it.
 

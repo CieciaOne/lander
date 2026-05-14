@@ -23,14 +23,22 @@
       <geom rgba="0.5 0.5 0.55 1"/>
     </default>
     <default class="wheel">
-      <!-- Friction tuned for both grip (so the corner wheels can spin the rover in
-           place against middle-wheel scrub) and stability (so the chassis CoM is
-           low enough to absorb the lateral scrub torque without lifting wheels).
-           Size 0.22 r × 0.12 half-thickness was reduced from 0.25 × 0.16 so
-           neighbouring wheels on the same side don't visually collide with the
-           narrower track (front/rear at x=±0.85, middle at ±0.95). -->
+      <!-- Visual cylinder only (contype/conaffinity=0). The actual contact is
+           handled by an invisible sphere geom (class="wheel_contact") sitting
+           in the same body. Reason: MJX 3.5 supports sphere–{plane, box,
+           hfield, mesh} but NOT cylinder–{box, hfield, mesh}; switching the
+           collision primitive to a sphere unlocks GPU-accelerated rollouts
+           with the same wheel kinematics (the wheel still rotates about its
+           axle joint, so contact velocity = ω × r is unchanged). -->
       <geom type="cylinder" rgba="0.15 0.15 0.18 1" friction="1.8 0.1 0.01"
-            size="0.22 0.12"/>
+            size="0.22 0.12" contype="0" conaffinity="0"/>
+    </default>
+    <default class="wheel_contact">
+      <!-- Invisible sphere that handles all wheel contacts. Radius matches
+           the visual cylinder radius, so the rolling contact point sits at
+           the same height as before. Friction is duplicated from the wheel
+           class because the cylinder visual no longer contacts anything. -->
+      <geom type="sphere" size="0.22" rgba="0 0 0 0" friction="1.8 0.1 0.01"/>
     </default>
     <default class="arm">
       <!-- density 300 keeps arm bodies light (~0.4–0.8 kg each) without explicit inertials -->
@@ -82,8 +90,13 @@
       <camera name="chase" pos="0 -4.5 2.0" mode="targetbody" target="base_link" fovy="55"/>
       <geom name="chassis" class="chassis" type="box" size="0.55 0.95 0.18"/>
       <geom name="back_box" class="chassis" type="box" size="0.45 0.25 0.25" pos="0 -0.8 0.25"/>
-      <geom name="mast" class="arm" type="cylinder" size="0.04 0.4" pos="0.0 0.55 0.45"/>
-      <geom name="mast_head" class="arm" type="box" size="0.12 0.06 0.06" pos="0.0 0.55 0.85"/>
+      <!-- Mast + mast head are decorative (sensor support, not navigation
+           obstacles). Collision off so we don't drag MJX into checking
+           cylinder-{box,hfield} pairs it doesn't support. -->
+      <geom name="mast" class="arm" type="cylinder" size="0.04 0.4" pos="0.0 0.55 0.45"
+            contype="0" conaffinity="0"/>
+      <geom name="mast_head" class="arm" type="box" size="0.12 0.06 0.06" pos="0.0 0.55 0.85"
+            contype="0" conaffinity="0"/>
 
       <!-- Mast-mounted navigation camera, looks forward (rover forward = +Y).
            Camera convention: image plane is XY of camera frame; camera looks down -Z.
@@ -107,16 +120,22 @@
            forward (+Y); shoulder positive lifts up, elbow positive folds in. -->
       <body name="arm_base" pos="0 0.95 -0.05">
         <joint name="arm_yaw" axis="0 0 1" range="-1.57 1.57" damping="15"/>
-        <geom class="arm" type="cylinder" size="0.06 0.05"/>
+        <!-- Arm cylinders/capsules collide with nothing during nav training
+             (the arm is pinned to a stow pose); turning collision off keeps
+             MJX from rejecting the model due to cylinder-{box,hfield} pairs
+             that would never actually trigger anyway. -->
+        <geom class="arm" type="cylinder" size="0.06 0.05" contype="0" conaffinity="0"/>
         <body name="arm_1" pos="0 0.06 0">
           <joint name="arm_shoulder" axis="1 0 0" range="-1.5 1.5" damping="15"/>
-          <geom class="arm" type="capsule" fromto="0 0 0 0 0.50 0" size="0.04"/>
+          <geom class="arm" type="capsule" fromto="0 0 0 0 0.50 0" size="0.04"
+                contype="0" conaffinity="0"/>
           <body name="arm_2" pos="0 0.50 0">
             <joint name="arm_elbow" axis="1 0 0" range="-2.5 2.5" damping="12"/>
-            <geom class="arm" type="capsule" fromto="0 0 0 0 0.40 0" size="0.035"/>
+            <geom class="arm" type="capsule" fromto="0 0 0 0 0.40 0" size="0.035"
+                  contype="0" conaffinity="0"/>
             <body name="arm_tool" pos="0 0.40 0">
               <joint name="arm_wrist" axis="0 1 0" range="-2.5 2.5" damping="8"/>
-              <geom class="arm" type="box" size="0.06 0.06 0.04"/>
+              <geom class="arm" type="box" size="0.06 0.06 0.04" contype="0" conaffinity="0"/>
               <site name="tool_tip" pos="0 0.06 0"/>
             </body>
           </body>
@@ -163,6 +182,7 @@
           <body name="wheel_right_front" pos="0 0 -0.28">
             <joint name="wheel_right_front_joint" axis="1 0 0"/>
             <geom class="wheel" euler="0 1.5707963 0"/>
+            <geom class="wheel_contact"/>
             <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
         </body>
@@ -192,6 +212,7 @@
           <body name="wheel_right_middle" pos="0.05 0.35 -0.48">
             <joint name="wheel_right_middle_joint" axis="1 0 0"/>
             <geom class="wheel" euler="0 1.5707963 0"/>
+            <geom class="wheel_contact"/>
             <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
 
@@ -203,6 +224,8 @@
             <body name="wheel_right_rear" pos="0 0 -0.28">
               <joint name="wheel_right_rear_joint" axis="1 0 0"/>
               <geom class="wheel" euler="0 1.5707963 0"/>
+              <geom class="wheel_contact"/>
+            <geom class="wheel_contact"/>
               <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
             </body>
           </body>
@@ -226,6 +249,7 @@
           <body name="wheel_left_front" pos="0 0 -0.28">
             <joint name="wheel_left_front_joint" axis="1 0 0"/>
             <geom class="wheel" euler="0 1.5707963 0"/>
+            <geom class="wheel_contact"/>
             <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
         </body>
@@ -248,6 +272,7 @@
           <body name="wheel_left_middle" pos="-0.05 0.35 -0.48">
             <joint name="wheel_left_middle_joint" axis="1 0 0"/>
             <geom class="wheel" euler="0 1.5707963 0"/>
+            <geom class="wheel_contact"/>
             <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
           </body>
 
@@ -259,6 +284,8 @@
             <body name="wheel_left_rear" pos="0 0 -0.28">
               <joint name="wheel_left_rear_joint" axis="1 0 0"/>
               <geom class="wheel" euler="0 1.5707963 0"/>
+              <geom class="wheel_contact"/>
+            <geom class="wheel_contact"/>
               <inertial pos="0 0 0" mass="1.5" diaginertia="0.036 0.025 0.025"/>
             </body>
           </body>

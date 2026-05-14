@@ -60,11 +60,15 @@ def _scenario_label(mission: Mission) -> str:
     return mission.name[: -len(suffix)] if mission.name.endswith(suffix) else mission.name
 
 
-def run_mission(mission: Mission, results_dir: Path, n_envs: int = 1) -> Path:
+def run_mission(mission: Mission, results_dir: Path, n_envs: int = 1,
+                backend: str = "cpu", mjx_impl: str = "jax") -> Path:
     scenario_label = _scenario_label(mission)
     out_dir = results_dir / scenario_label / mission.cl_method / f"seed_{mission.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    runner = Runner(mission, results_dir=out_dir, verbose=True, n_envs=n_envs)
+    runner = Runner(
+        mission, results_dir=out_dir, verbose=True, n_envs=n_envs,
+        backend=backend, mjx_impl=mjx_impl,
+    )
     runner.run()
 
     results = load_results(out_dir / "results.json")
@@ -135,7 +139,8 @@ def _print_aggregated_summary(
               f"{fg_mean:>12.3f} {fg_std:>11.3f}")
 
 
-def run_missions(missions: list[Mission], results_dir: Path, n_envs: int = 1) -> None:
+def run_missions(missions: list[Mission], results_dir: Path, n_envs: int = 1,
+                 backend: str = "cpu", mjx_impl: str = "jax") -> None:
     """Train each mission and print an aggregated mean +/- std summary."""
     if not missions:
         raise SystemExit("run_missions: no missions to run")
@@ -143,7 +148,7 @@ def run_missions(missions: list[Mission], results_dir: Path, n_envs: int = 1) ->
     # All missions in one invocation share a scenario + cl_method (we never
     # build mixed batches here), so we can group them under one label.
     for m in missions:
-        run_mission(m, results_dir, n_envs=n_envs)
+        run_mission(m, results_dir, n_envs=n_envs, backend=backend, mjx_impl=mjx_impl)
 
     scenario_label = _scenario_label(missions[0])
     method = missions[0].cl_method
@@ -269,6 +274,20 @@ def main() -> None:
                          "and roughly halves wall-clock for the same number of "
                          "PPO updates. EWC / replay post-training collection "
                          "still uses a single env.")
+    ap.add_argument("--backend", default="cpu", choices=["cpu", "mjx"],
+                    help="Rollout backend. 'cpu' (default) uses SubprocVecEnv "
+                         "with native MuJoCo, one process per env. 'mjx' uses "
+                         "MuJoCo-XLA — a single JAX-jitted batched env that "
+                         "vectorises `--n-envs` rovers under one process. MJX "
+                         "wins on GPU/TPU; on Mac CPU JAX it is slower than the "
+                         "subproc path. Default: cpu.")
+    ap.add_argument("--mjx-impl", default="jax", choices=["jax", "warp"],
+                    help="MJX collision-pipeline backend. 'jax' (default) is "
+                         "portable. 'warp' enables Nvidia's MuJoCo-Warp path — "
+                         "requires Linux + CUDA + `pip install nvidia-warp` and "
+                         "the mujoco-warp extras. Adds support for cylinder-mesh, "
+                         "ellipsoid-cylinder, and ellipsoid-hfield collisions on "
+                         "supported hardware. Ignored when --backend=cpu.")
     ap.add_argument("--compare", action="store_true",
                     help="Aggregate all CL methods + seeds for this scenario "
                          "into one plot (comparison.png) and one summary.csv.")
@@ -282,7 +301,8 @@ def main() -> None:
 
     if args.config is not None:
         missions = load_missions_config(args.config)
-        run_missions(missions, args.results_dir, n_envs=args.n_envs)
+        run_missions(missions, args.results_dir, n_envs=args.n_envs,
+                 backend=args.backend, mjx_impl=args.mjx_impl)
         return
 
     if args.scenario is None:
@@ -292,7 +312,8 @@ def main() -> None:
     missions = _build_missions_from_cli(
         args.scenario, args.cl_method, args.train_steps, seeds,
     )
-    run_missions(missions, args.results_dir, n_envs=args.n_envs)
+    run_missions(missions, args.results_dir, n_envs=args.n_envs,
+                 backend=args.backend, mjx_impl=args.mjx_impl)
 
 
 if __name__ == "__main__":

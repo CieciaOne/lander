@@ -150,7 +150,8 @@ class Runner:
     """Executes a Mission and returns a MissionResult."""
 
     def __init__(self, mission: Mission, results_dir: Path | None = None,
-                 verbose: bool = True, n_envs: int = 1):
+                 verbose: bool = True, n_envs: int = 1,
+                 backend: str = "cpu", mjx_impl: str = "jax"):
         self.mission = mission
         self.results_dir = Path(results_dir) if results_dir is not None else None
         self.verbose = verbose
@@ -159,6 +160,13 @@ class Runner:
         # cores for OS / Python / the policy gradient step. EWC/Replay's
         # post-training collection still uses a single fresh env.
         self.n_envs = max(1, int(n_envs))
+        # backend = "cpu" → SubprocVecEnv of native-MuJoCo envs (default).
+        # backend = "mjx" → MjxVecEnv (JAX + mjx.put_model). On CUDA the GPU
+        # backend runs N envs in parallel inside one process. `mjx_impl` is
+        # forwarded to mjx.put_model — "jax" everywhere, "warp" only on a
+        # Linux box with nvidia-warp installed and an Nvidia GPU.
+        self.backend = backend
+        self.mjx_impl = mjx_impl
         # `_run_start_perf` is set when run() begins; _log uses it to print
         # elapsed-since-start alongside the local clock time.
         self._run_start_perf: float | None = None
@@ -215,8 +223,22 @@ class Runner:
                       f"train on {task.task_id} "
                       f"({task.train_timesteps} timesteps, n_envs={self.n_envs})")
 
-            using_vec = self.n_envs > 1
-            if using_vec:
+            using_vec = self.n_envs > 1 or self.backend == "mjx"
+            if self.backend == "mjx":
+                # MJX: a single MjxVecEnv that batches N envs in JAX. The
+                # `task.env_factory` is a closure built by the scenario that
+                # returns a `RoverNavEnv(terrain=...)` — we peek at the
+                # terrain name and rebuild an MjxVecEnv on top of it.
+                terrain_name = task.task_id
+                from rover_cl.envs.mjx_vec_env import MjxVecEnv
+                train_env = MjxVecEnv(
+                    terrain=terrain_name,
+                    n_envs=max(self.n_envs, 1),
+                    seed=self.mission.seed + phase,
+                    max_steps=getattr(task, "max_steps", 500),
+                    impl=self.mjx_impl,
+                )
+            elif using_vec:
                 from stable_baselines3.common.monitor import Monitor
                 from stable_baselines3.common.vec_env import SubprocVecEnv
 
