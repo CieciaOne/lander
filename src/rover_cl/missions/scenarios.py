@@ -423,26 +423,32 @@ def scenario_11_robust_generalist(
     """
     # (terrain, base_multiplier, ent_coef_override, advance_threshold)
     #
-    # Tuning notes from the v1 run:
-    #  - Phase 0 (locomotion) stalled at ~0.33 success with default
-    #    ent_coef=0.01 because random-init PPO freezes near start. The
-    #    same "freeze near start" optimum the README warns about. Forcing
-    #    ent_coef=0.03 here gives the rover enough exploration to escape.
-    #  - Phase 1 (path_following) had similar issues, mid-30s success at
-    #    the budget; same 0.03 bump applied.
-    #  - Phase-0/1 advance thresholds dropped from 0.90/0.80 → 0.70/0.65
-    #    to be reachable inside the 2× max budget. Below this PPO oscillates
-    #    rather than converging — the gate would just always max out
-    #    regardless.
-    #  - The terrain phases keep default ent_coef (heightmap variability
-    #    already provides effective exploration through state diversity).
+    # Tuning notes from runs v1 and v2:
+    #  - v1 (ent_coef default, n_envs=4): phase 0 reached ~0.33 success.
+    #    v2 (ent_coef=0.03, n_envs=12):  phase 0 reached only ~0.08.
+    #    Bumping entropy on the foundation phases ACTIVELY HURT — random-
+    #    init PPO already explores enough; the extra entropy bonus
+    #    prevented the policy from committing to forward driving once
+    #    the progress reward signal appeared. Reverted phases 0-1 to
+    #    default ent_coef.
+    #  - Obstacle phases (2-3) DO benefit from ent_coef=0.03 — there the
+    #    "freeze near start" basin is genuinely deep because collision
+    #    penalty + step cost can beat slow progress. Kept the bump.
+    #  - Advance thresholds dropped to 0.45-0.55 across the board. The
+    #    realistic ceiling within 2× max budget per phase is ~0.40-0.60
+    #    on the early phases; higher thresholds mean the gate never
+    #    fires (effectively a no-op). The point of the curriculum is to
+    #    bootstrap a policy good enough for later phases to refine, not
+    #    to perfect every phase individually.
+    #  - Terrain phases keep default ent_coef (heightmap diversity
+    #    provides state-space exploration without action-space noise).
     phase_plan: list[tuple[str, float, float | None, float | None]] = [
-        ("RC_locomotion",          1.0, 0.03,  0.70),
-        ("RC_path_following",      1.5, 0.03,  0.65),
-        ("RC_obstacle_avoidance",  2.0, 0.03,  0.60),
-        ("RC_path_and_obstacles",  1.5, 0.03,  0.55),
-        ("RC_terrain",             1.5, None,  0.65),
-        ("RC_terrain_plus",        1.5, 0.02,  0.55),
+        ("RC_locomotion",          1.0, None,  0.55),
+        ("RC_path_following",      1.5, None,  0.50),
+        ("RC_obstacle_avoidance",  2.0, 0.03,  0.45),
+        ("RC_path_and_obstacles",  1.5, 0.03,  0.45),
+        ("RC_terrain",             1.5, None,  0.55),
+        ("RC_terrain_plus",        1.5, 0.02,  0.45),
         ("RC_full_random",         2.0, 0.02,  None),
     ]
     cl_kwargs: dict = {"lam": ewc_lam} if cl_method == "ewc" else {}
