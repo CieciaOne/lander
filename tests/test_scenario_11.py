@@ -59,22 +59,30 @@ def test_rc_terrain_rolls_and_settles(name):
 
 
 def test_rc_full_random_samples_diverse_layouts():
-    """RC_full_random should produce a meaningful mix across 30 rolls."""
+    """RC_full_random should produce a meaningful mix across 60 rolls.
+
+    Counts VISIBLE obstacles (positions above HIDE_Z=-50), not list length
+    — the list is always `max_slots` entries because hidden slots get
+    padded with HIDE_Z so the env's strict length check still passes.
+    """
+    from rover_cl.envs.randomization import HIDE_Z
+
     spec = TERRAIN_CATALOG["RC_full_random"](seed=0)
     rng = np.random.default_rng(1)
     n_waypoints = []
-    n_obstacles = []
+    n_visible_obstacles = []
     has_terrain = []
     for _ in range(60):
         roll = spec.randomize_on_reset(rng)
         n_waypoints.append(len(roll.waypoints))
-        n_obstacles.append(len(roll.obstacle_positions))
+        n_vis = sum(1 for p in roll.obstacle_positions if p[2] > HIDE_Z + 1.0)
+        n_visible_obstacles.append(n_vis)
         has_terrain.append(roll.heightmap is not None and roll.heightmap.max() > 0.05)
     # Distribution should cover the full range of each axis.
     assert max(n_waypoints) >= 2, f"waypoint count too narrow: max={max(n_waypoints)}"
     assert min(n_waypoints) == 0
-    assert max(n_obstacles) >= 3
-    assert min(n_obstacles) == 0
+    assert max(n_visible_obstacles) >= 3
+    assert min(n_visible_obstacles) == 0
     # At least some episodes should have meaningful terrain.
     assert any(has_terrain), "no rolls produced non-flat terrain"
 

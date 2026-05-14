@@ -422,17 +422,27 @@ def scenario_11_robust_generalist(
     `--n-envs 6` on M3 Air: 3-5 hours wall-clock per seed.
     """
     # (terrain, base_multiplier, ent_coef_override, advance_threshold)
-    # Advance thresholds: easier phases set 0.85, harder phases 0.65 — the
-    # gate gives easy phases an early stop while letting hard ones absorb
-    # the slack. The capstone has no threshold (no advance after it) so
-    # the gate falls back to max_budget for that phase.
+    #
+    # Tuning notes from the v1 run:
+    #  - Phase 0 (locomotion) stalled at ~0.33 success with default
+    #    ent_coef=0.01 because random-init PPO freezes near start. The
+    #    same "freeze near start" optimum the README warns about. Forcing
+    #    ent_coef=0.03 here gives the rover enough exploration to escape.
+    #  - Phase 1 (path_following) had similar issues, mid-30s success at
+    #    the budget; same 0.03 bump applied.
+    #  - Phase-0/1 advance thresholds dropped from 0.90/0.80 → 0.70/0.65
+    #    to be reachable inside the 2× max budget. Below this PPO oscillates
+    #    rather than converging — the gate would just always max out
+    #    regardless.
+    #  - The terrain phases keep default ent_coef (heightmap variability
+    #    already provides effective exploration through state diversity).
     phase_plan: list[tuple[str, float, float | None, float | None]] = [
-        ("RC_locomotion",          1.0, None,  0.90),
-        ("RC_path_following",      1.5, None,  0.80),
-        ("RC_obstacle_avoidance",  2.0, 0.03,  0.70),
-        ("RC_path_and_obstacles",  1.5, 0.03,  0.65),
-        ("RC_terrain",             1.5, None,  0.75),
-        ("RC_terrain_plus",        1.5, 0.02,  0.65),
+        ("RC_locomotion",          1.0, 0.03,  0.70),
+        ("RC_path_following",      1.5, 0.03,  0.65),
+        ("RC_obstacle_avoidance",  2.0, 0.03,  0.60),
+        ("RC_path_and_obstacles",  1.5, 0.03,  0.55),
+        ("RC_terrain",             1.5, None,  0.65),
+        ("RC_terrain_plus",        1.5, 0.02,  0.55),
         ("RC_full_random",         2.0, 0.02,  None),
     ]
     cl_kwargs: dict = {"lam": ewc_lam} if cl_method == "ewc" else {}

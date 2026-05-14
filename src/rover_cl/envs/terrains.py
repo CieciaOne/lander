@@ -1051,48 +1051,38 @@ def terrain_RT_mixed(seed: int = 0) -> TerrainSpec:
 def terrain_RC_locomotion(seed: int = 0) -> TerrainSpec:
     """Phase 0: drive to a single goal. No waypoints, no obstacles. Flat.
 
-    Within-phase mix on goal bearing relative to the rover's starting yaw:
-        50% front cone (0–45°)            — easy "go straight"
-        25% side cone (60–110°)           — turn-from-rest, single direction
-        15% behind cone (135–180°)        — U-turn-from-rest
-        10% short-hop (target < 2 m away) — teaches "stop", anchors success
-                                             on the trivial case so the
-                                             policy doesn't conflate goal
-                                             reaching with extended driving.
+    Simpler bearing mix than v1 — the v1 short-hop case (10%, 1-2 m away)
+    confused random-init PPO because "you're already at the goal, hold
+    here for 5 steps" requires a precise zero-velocity skill the policy
+    can't learn from progress reward alone. Removing it; the "hold at
+    goal" case shows up naturally at the end of every normal trajectory.
 
-    Distance: 5–12 m for the 90% non-short-hop slice. The short-hop slice
-    deliberately violates the usual `min_separation` so the policy sees
-    "you're already there" inputs.
+    Within-phase mix:
+        70% front cone   (goal in front, 5-12 m)  — anchor case
+        20% side cone    (goal at ~90°, 5-10 m)   — turn-from-rest
+        10% behind cone  (goal behind, 4-9 m)     — U-turn-from-rest
+
+    The biggest change vs v1 is **dropping the short-hop case** (was
+    holding the success rate well below half because random-init PPO
+    learns "drive then stop" before it learns "stop").
     """
     spec = _flat_template("RC_locomotion", max_obstacles=0)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
         r = rng.uniform()
-        if r < 0.50:
+        if r < 0.70:
             bearing = "front"
             min_sep = 5.0
-        elif r < 0.75:
+        elif r < 0.90:
             bearing = "side"
             min_sep = 5.0
-        elif r < 0.90:
-            bearing = "behind"
-            min_sep = 5.0
         else:
-            # Short-hop "stop here" case: 1–2 m away.
-            bearing = "uniform"
-            min_sep = 1.0
+            bearing = "behind"
+            min_sep = 4.0
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=min_sep, margin=2.0,
             relative_bearing=bearing,
         )
-        # For the short-hop case, override goal to be 1–2 m from start in
-        # whatever direction the sampler picked.
-        if min_sep == 1.0:
-            d = float(rng.uniform(1.0, 2.0))
-            ang = float(rng.uniform(0, 2 * np.pi))
-            gx = float(np.clip(start[0] + d * np.cos(ang), -10.0, 10.0))
-            gy = float(np.clip(start[1] + d * np.sin(ang), -10.0, 10.0))
-            goal = (gx, gy)
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal,
             waypoints=(),
@@ -1160,26 +1150,35 @@ def terrain_RC_path_following(seed: int = 0) -> TerrainSpec:
 
 
 def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
-    """Phase 2: obstacle dodging, density-mixed. Flat, no waypoints.
+    """Phase 2: obstacle dodging, density-mixed. Flat.
 
     Within-phase mix on obstacle count:
-        25% 0 obstacles    — anchor: phase-0-equivalent stays alive
+        25% 0 obstacles    — anchor: phase-0-equivalent stays alive.
+                             HALF of these (12.5% overall) include 1-2
+                             on-line waypoints so phase-1 path-following
+                             is also preserved — without this slice,
+                             phase 1's skill got wiped during the v1 run.
         30% 1–2 obstacles  — easy avoidance
         30% 3–6 obstacles  — moderate field
         15% 7–10 obstacles — dense field
 
-    The 25% anchor slice is the headline change vs. scenario_10's obstacle
-    phases, which only got a 20% anchor and not all the way down to ZERO
-    obstacles for the densest phase.
+    The 25% anchor slice with embedded waypoints is the headline change
+    vs. v1, which only preserved "drive without obstacles" and let path-
+    following collapse to 0 during this phase.
     """
     spec = _flat_template("RC_obstacle_avoidance", max_obstacles=10,
                           ground_rgba=(0.55, 0.40, 0.32, 1.0))
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
         r = rng.uniform()
+        wps: tuple = ()
         if r < 0.25:
             n = 0
             jitter = 1.0
+            # 50% of anchor episodes get 1-2 path-following waypoints so
+            # phase-1 skill survives obstacle training.
+            if rng.uniform() < 0.5:
+                pass  # handled below after start/goal sampled
         elif r < 0.55:
             n = int(rng.integers(1, 3))   # 1 or 2
             jitter = 0.9
@@ -1192,6 +1191,14 @@ def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
         start, yaw, goal = sample_start_goal_pair(
             rng, arena_half=12.0, min_separation=7.0, margin=2.0,
         )
+        # Anchor sub-case: 50% of the no-obstacle slice gets waypoints
+        # (= 12.5% of all episodes hold the path-following skill alive).
+        if r < 0.25 and rng.uniform() < 0.5:
+            wps = sample_waypoints_between(
+                rng, start, goal,
+                n_waypoints=int(rng.integers(1, 3)),
+                lateral_jitter=0.8,
+            )
         pos, sz = sample_obstacles_along_path(
             rng, start, goal,
             n_obstacles=n, max_slots=10,
@@ -1199,7 +1206,7 @@ def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
             lateral_jitter=jitter,
         )
         return TerrainRoll(
-            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=(),
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
             obstacle_positions=pos, obstacle_sizes=sz,
         )
     spec.randomize_on_reset = _roll
@@ -1227,7 +1234,14 @@ def terrain_RC_path_and_obstacles(seed: int = 0) -> TerrainSpec:
                 rng, start, goal, n_waypoints=int(rng.integers(1, 3)),
                 lateral_jitter=1.0,
             )
-            pos, sz = [], []
+            # Compiled model has 8 obstacle slots; the sampler pads with
+            # HIDE_Z so the env's "n_positions must match n_slots" check
+            # still passes when this branch wants ZERO obstacles.
+            pos, sz = sample_obstacles_along_path(
+                rng, start, goal,
+                n_obstacles=0, max_slots=8,
+                size_range=(0.4, 0.65), lateral_jitter=1.0,
+            )
         elif r < 0.60:
             wps = ()
             n = int(rng.integers(3, 7))
@@ -1335,15 +1349,15 @@ def terrain_RC_terrain_plus(seed: int = 0) -> TerrainSpec:
         else:
             hm = hm * 0.75           # ~0.3 m peaks
             n_obs = 0
-        if n_obs > 0:
-            pos, sz = sample_obstacles_along_path(
-                rng, start, goal,
-                n_obstacles=n_obs, max_slots=6,
-                size_range=(0.4, 0.65), lateral_jitter=1.6,
-                heightmap=hm, heightmap_extent=(11.0, 11.0, 0.4),
-            )
-        else:
-            pos, sz = [], []
+        # Always route through the sampler so empty branches still produce
+        # `max_slots` HIDE_Z entries — the env's TerrainRoll length check
+        # is strict.
+        pos, sz = sample_obstacles_along_path(
+            rng, start, goal,
+            n_obstacles=n_obs, max_slots=6,
+            size_range=(0.4, 0.65), lateral_jitter=1.6,
+            heightmap=hm, heightmap_extent=(11.0, 11.0, 0.4),
+        )
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=(),
             obstacle_positions=pos, obstacle_sizes=sz,
@@ -1432,16 +1446,15 @@ def terrain_RC_full_random(seed: int = 0) -> TerrainSpec:
             hm = hm * 1.0
             terrain_z = 0.50  # full elevation_z
 
-        if n_obs > 0:
-            pos, sz = sample_obstacles_along_path(
-                rng, start, goal,
-                n_obstacles=n_obs, max_slots=8,
-                size_range=(0.4, 0.65),
-                lateral_jitter=1.4 + 0.3 * (n_obs / 8.0),
-                heightmap=hm, heightmap_extent=(11.0, 11.0, 0.5),
-            )
-        else:
-            pos, sz = [], []
+        # Always route through the sampler (n=0 returns max_slots HIDE_Z
+        # entries) so the env's strict length check passes.
+        pos, sz = sample_obstacles_along_path(
+            rng, start, goal,
+            n_obstacles=n_obs, max_slots=8,
+            size_range=(0.4, 0.65),
+            lateral_jitter=1.4 + 0.3 * (n_obs / 8.0),
+            heightmap=hm, heightmap_extent=(11.0, 11.0, 0.5),
+        )
 
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
