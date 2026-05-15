@@ -1176,21 +1176,32 @@ def terrain_RC_path_following(seed: int = 0) -> TerrainSpec:
 
 
 def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
-    """Phase 2: obstacle dodging, density-mixed. Flat.
+    """Phase 2: obstacle dodging — density + distance curriculum.
 
-    Within-phase mix on obstacle count:
-        25% 0 obstacles    — anchor: phase-0-equivalent stays alive.
-                             HALF of these (12.5% overall) include 1-2
-                             on-line waypoints so phase-1 path-following
-                             is also preserved — without this slice,
-                             phase 1's skill got wiped during the v1 run.
-        30% 1–2 obstacles  — easy avoidance
-        30% 3–6 obstacles  — moderate field
-        15% 7–10 obstacles — dense field
+    The v2/v3 runs showed phase 2 obliterating phases 0-1 (mean return
+    went −30 → −100 in the first 200k steps) because the jump from
+    "no obstacles" to "up to 10 obstacles" was too steep. The 32 obstacle
+    obs-slots are padded sentinels for phases 0-1; they suddenly carry
+    real signal here, and the policy can't learn to attend to them while
+    also keeping the locomotion skill — it crashes both.
 
-    The 25% anchor slice with embedded waypoints is the headline change
-    vs. v1, which only preserved "drive without obstacles" and let path-
-    following collapse to 0 during this phase.
+    Fix: a 2-axis curriculum WITHIN this phase. Mostly easy episodes
+    (short goals, 1-2 obstacles) for bootstrap; some hard ones for
+    generalisation.
+
+    Within-phase mix:
+        30% no obstacles, short goals (2-4 m)      — locomotion anchor.
+                                                     50% of these get 1-2
+                                                     waypoints to keep
+                                                     path-following alive.
+        35% 1-2 obstacles, short-medium (3-6 m)   — easiest avoidance.
+        20% 2-3 obstacles, medium (4-7 m)         — standard.
+        10% 4-6 obstacles, medium-long (5-9 m)    — harder field.
+         5% 7-10 obstacles, long (6-10 m)         — dense field anchor.
+
+    Also reverts ent_coef from 0.03 → default (handled in scenario_11
+    phase plan, NOT here). Same lesson as phase 0: forced exploration
+    actively prevents the policy from committing to a working strategy.
     """
     spec = _flat_template("RC_obstacle_avoidance", max_obstacles=10,
                           ground_rgba=(0.55, 0.40, 0.32, 1.0))
@@ -1198,37 +1209,37 @@ def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
     def _roll(rng: np.random.Generator) -> TerrainRoll:
         r = rng.uniform()
         wps: tuple = ()
-        if r < 0.25:
-            n = 0
-            jitter = 1.0
-            # 50% of anchor episodes get 1-2 path-following waypoints so
-            # phase-1 skill survives obstacle training.
-            if rng.uniform() < 0.5:
-                pass  # handled below after start/goal sampled
-        elif r < 0.55:
+        if r < 0.30:
+            n, jitter, dmin, dmax = 0, 1.0, 2.0, 4.0
+        elif r < 0.65:
             n = int(rng.integers(1, 3))   # 1 or 2
-            jitter = 0.9
+            jitter, dmin, dmax = 0.9, 3.0, 6.0
         elif r < 0.85:
-            n = int(rng.integers(3, 7))   # 3..6
-            jitter = 1.5
+            n = int(rng.integers(2, 4))   # 2 or 3
+            jitter, dmin, dmax = 1.2, 4.0, 7.0
+        elif r < 0.95:
+            n = int(rng.integers(4, 7))   # 4..6
+            jitter, dmin, dmax = 1.6, 5.0, 9.0
         else:
             n = int(rng.integers(7, 11))  # 7..10
-            jitter = 2.2
+            jitter, dmin, dmax = 2.2, 6.0, 10.0
         start, yaw, goal = sample_start_goal_pair(
-            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
+            rng, arena_half=12.0,
+            min_separation=dmin, max_separation=dmax,
+            margin=2.0,
         )
         # Anchor sub-case: 50% of the no-obstacle slice gets waypoints
-        # (= 12.5% of all episodes hold the path-following skill alive).
-        if r < 0.25 and rng.uniform() < 0.5:
+        # (= 15% of all episodes hold the path-following skill alive).
+        if r < 0.30 and rng.uniform() < 0.5:
             wps = sample_waypoints_between(
                 rng, start, goal,
                 n_waypoints=int(rng.integers(1, 3)),
-                lateral_jitter=0.8,
+                lateral_jitter=0.6,
             )
         pos, sz = sample_obstacles_along_path(
             rng, start, goal,
             n_obstacles=n, max_slots=10,
-            size_range=(0.4, 0.65),
+            size_range=(0.4, 0.6),
             lateral_jitter=jitter,
         )
         return TerrainRoll(
@@ -1242,53 +1253,76 @@ def terrain_RC_obstacle_avoidance(seed: int = 0) -> TerrainSpec:
 def terrain_RC_path_and_obstacles(seed: int = 0) -> TerrainSpec:
     """Phase 3: compose waypoints + obstacles. Flat.
 
+    Same 2-axis curriculum approach as RC_obstacle_avoidance — most
+    episodes are easy compositions (short goal, 1-2 obstacles, 0-1
+    waypoint); some are harder.
+
     Within-phase mix:
-        20% waypoints only       — phase-1 anchor
-        40% obstacles only       — phase-2 anchor
-        40% obstacles AND 1–2 waypoints — new skill (path-planning around objects)
+        25% waypoints only, short paths (4-6 m)        — phase-1 anchor.
+        30% 1-2 obstacles only, short (3-5 m)          — phase-2 anchor.
+        25% 1 waypoint + 1-2 obstacles, short (4-6 m)  — easy compose.
+        15% 1-2 waypoints + 2-4 obstacles, med (5-8 m) — medium compose.
+         5% 2 waypoints + 3-5 obstacles, longer (6-9m) — full compose.
     """
     spec = _flat_template("RC_path_and_obstacles", max_obstacles=8,
                           ground_rgba=(0.58, 0.42, 0.30, 1.0))
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
-        start, yaw, goal = sample_start_goal_pair(
-            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
-        )
         r = rng.uniform()
-        if r < 0.20:
-            wps = sample_waypoints_between(
-                rng, start, goal, n_waypoints=int(rng.integers(1, 3)),
-                lateral_jitter=1.0,
-            )
-            # Compiled model has 8 obstacle slots; the sampler pads with
-            # HIDE_Z so the env's "n_positions must match n_slots" check
-            # still passes when this branch wants ZERO obstacles.
-            pos, sz = sample_obstacles_along_path(
-                rng, start, goal,
-                n_obstacles=0, max_slots=8,
-                size_range=(0.4, 0.65), lateral_jitter=1.0,
-            )
-        elif r < 0.60:
-            wps = ()
-            n = int(rng.integers(3, 7))
-            pos, sz = sample_obstacles_along_path(
-                rng, start, goal,
-                n_obstacles=n, max_slots=8,
-                size_range=(0.4, 0.65), lateral_jitter=1.6,
-            )
-        else:
+        if r < 0.25:
+            # Phase-1 anchor: waypoints only.
+            dmin, dmax = 4.0, 6.0
+            n_obs = 0
             n_wp = int(rng.integers(1, 3))
-            wps = sample_twisty_waypoints(
-                rng, start, goal, n_waypoints=n_wp,
-                arena_half=12.0, margin=2.0,
-                swing_min=1.2, swing_max=2.5, alternate_sides=True,
-            )
-            n_obs = int(rng.integers(2, 6))
-            pos, sz = sample_obstacles_along_path(
-                rng, start, goal,
-                n_obstacles=n_obs, max_slots=8,
-                size_range=(0.4, 0.65), lateral_jitter=1.4,
-            )
+            use_twisty = False
+        elif r < 0.55:
+            # Phase-2 anchor: obstacles only, easy density.
+            dmin, dmax = 3.0, 5.0
+            n_obs = int(rng.integers(1, 3))
+            n_wp = 0
+            use_twisty = False
+        elif r < 0.80:
+            # Easy compose: 1 waypoint + 1-2 obstacles.
+            dmin, dmax = 4.0, 6.0
+            n_obs = int(rng.integers(1, 3))
+            n_wp = 1
+            use_twisty = False
+        elif r < 0.95:
+            # Medium compose.
+            dmin, dmax = 5.0, 8.0
+            n_obs = int(rng.integers(2, 5))
+            n_wp = int(rng.integers(1, 3))
+            use_twisty = True
+        else:
+            # Full compose, harder.
+            dmin, dmax = 6.0, 9.0
+            n_obs = int(rng.integers(3, 6))
+            n_wp = 2
+            use_twisty = True
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0,
+            min_separation=dmin, max_separation=dmax, margin=2.0,
+        )
+        if n_wp > 0:
+            if use_twisty:
+                wps = sample_twisty_waypoints(
+                    rng, start, goal, n_waypoints=n_wp,
+                    arena_half=12.0, margin=2.0,
+                    swing_min=1.0, swing_max=2.2, alternate_sides=True,
+                )
+            else:
+                wps = sample_waypoints_between(
+                    rng, start, goal, n_waypoints=n_wp,
+                    lateral_jitter=0.8,
+                )
+        else:
+            wps = ()
+        pos, sz = sample_obstacles_along_path(
+            rng, start, goal,
+            n_obstacles=n_obs, max_slots=8,
+            size_range=(0.4, 0.6),
+            lateral_jitter=1.3,
+        )
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
             obstacle_positions=pos, obstacle_sizes=sz,

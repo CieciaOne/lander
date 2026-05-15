@@ -445,7 +445,16 @@ def scenario_11_robust_generalist(
     phase_plan: list[tuple[str, float, float | None, float | None]] = [
         ("RC_locomotion",          1.0, None,  0.55),
         ("RC_path_following",      1.5, None,  0.50),
-        ("RC_obstacle_avoidance",  2.0, 0.03,  0.45),
+        # Phase 2 (obstacle_avoidance) now uses a density+distance
+        # curriculum biased toward easy episodes (30% no-obs / 35%
+        # 1-2 obs at short distance). With that anchor in place the
+        # forced ent_coef=0.03 became counter-productive (same lesson
+        # as phase 0): the curriculum itself does the bootstrapping;
+        # extra entropy just prevents commitment. Reverted to default.
+        ("RC_obstacle_avoidance",  2.0, None,  0.45),
+        # Phase 3 keeps 0.03 — composition of waypoints + obstacles is
+        # genuinely harder than either alone, and the local minimum
+        # ("freeze when the obs slots show clutter") is deeper here.
         ("RC_path_and_obstacles",  1.5, 0.03,  0.45),
         ("RC_terrain",             1.5, None,  0.55),
         ("RC_terrain_plus",        1.5, 0.02,  0.45),
