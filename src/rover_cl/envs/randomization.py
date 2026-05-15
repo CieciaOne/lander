@@ -118,6 +118,7 @@ def sample_start_goal_pair(
     margin: float = 1.0,
     *,
     relative_bearing: str = "uniform",
+    max_separation: float | None = None,
 ) -> tuple[tuple[float, float], float, tuple[float, float]]:
     """Pick (start, yaw, goal) with goal at least `min_separation` from start.
 
@@ -138,6 +139,12 @@ def sample_start_goal_pair(
       specifically train manoeuvring rather than straight driving.
 
     `margin` keeps both points away from the arena boundary.
+
+    `max_separation`, when set, clips the random distance to
+    ``[min_separation, max_separation]`` instead of the default
+    ``[min_separation, min_separation + 4]``. Used by the scenario_11
+    distance-curriculum where phase 0's "short" slice wants tight 2-4 m
+    goals to give PPO a fast bootstrap signal.
     """
     if relative_bearing not in {"uniform", "front", "side", "behind", "maneuver"}:
         raise ValueError(f"unknown relative_bearing {relative_bearing!r}")
@@ -164,9 +171,12 @@ def sample_start_goal_pair(
         # Sample (distance, relative bearing) of the goal in rover frame.
         if bearing_range is None:
             # Original behaviour: goal anywhere in the box, yaw independent.
+            # When max_separation is set, also reject samples that exceed it
+            # so the distance-curriculum knobs work in this branch too.
             goal = _sample_point_in_box(rng, (-bound, bound), (-bound, bound))
             dx, dy = goal[0] - start[0], goal[1] - start[1]
-            if (dx * dx + dy * dy) ** 0.5 >= min_separation:
+            d = (dx * dx + dy * dy) ** 0.5
+            if d >= min_separation and (max_separation is None or d <= max_separation):
                 return start, yaw, goal
             continue
 
@@ -191,9 +201,13 @@ def sample_start_goal_pair(
         # (i.e. +Y in body = (-sin(yaw), cos(yaw)) in world). A goal at
         # `rel_bearing=0` should sit straight ahead along that vector.
         world_bearing = yaw + np.pi / 2 + rel_bearing
-        # Distance: at least `min_separation`, up to whatever fits in the box
-        # given the start and a small safety margin.
-        max_d = min_separation + float(rng.uniform(0.0, 4.0))
+        # Distance: tight band [min_separation, max_separation] when the
+        # caller specified one (distance-curriculum), otherwise the legacy
+        # [min_separation, min_separation + 4] range.
+        if max_separation is not None:
+            max_d = float(rng.uniform(min_separation, max_separation))
+        else:
+            max_d = min_separation + float(rng.uniform(0.0, 4.0))
         gx = start[0] + max_d * float(np.cos(world_bearing))
         gy = start[1] + max_d * float(np.sin(world_bearing))
         if abs(gx) <= bound and abs(gy) <= bound:

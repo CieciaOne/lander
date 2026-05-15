@@ -1051,37 +1051,49 @@ def terrain_RT_mixed(seed: int = 0) -> TerrainSpec:
 def terrain_RC_locomotion(seed: int = 0) -> TerrainSpec:
     """Phase 0: drive to a single goal. No waypoints, no obstacles. Flat.
 
-    Simpler bearing mix than v1 — the v1 short-hop case (10%, 1-2 m away)
-    confused random-init PPO because "you're already at the goal, hold
-    here for 5 steps" requires a precise zero-velocity skill the policy
-    can't learn from progress reward alone. Removing it; the "hold at
-    goal" case shows up naturally at the end of every normal trajectory.
+    Distance-curriculum WITHIN this single phase (a "near-to-far"
+    bootstrap):
 
-    Within-phase mix:
-        70% front cone   (goal in front, 5-12 m)  — anchor case
-        20% side cone    (goal at ~90°, 5-10 m)   — turn-from-rest
-        10% behind cone  (goal behind, 4-9 m)     — U-turn-from-rest
+        50% short  (2-4 m, front cone)     — fast goal_bonus discovery
+        25% medium (4-7 m, front cone)     — standard difficulty
+        15% medium (4-7 m, side cone)      — short turn-from-rest
+        10% long   (5-10 m, mixed bearing) — full-spec hardest case
 
-    The biggest change vs v1 is **dropping the short-hop case** (was
-    holding the success rate well below half because random-init PPO
-    learns "drive then stop" before it learns "stop").
+    Rationale: random-init PPO needs to *experience* the +50 goal bonus
+    early to learn the value of moving toward goals. With 8-12 m goals
+    only (v1/v2), the rover essentially never reached the target during
+    the first ~100k steps — the value function stayed flat and the
+    policy gradient was driven entirely by per-step progress reward,
+    which is dwarfed by the stuck-no-progress penalty when the rover
+    can't make significant headway.
+
+    With 50% of episodes at 2-4 m, even a noisy "drift forward" policy
+    hits the goal often enough to anchor the value function. Once the
+    policy learns "forward = good when target is ahead", the longer-
+    distance slice generalises that knowledge.
+
+    The 15% short-side slice keeps the turn-from-rest skill in the mix
+    without trying to learn it from scratch on a 10 m + 90° goal
+    (which is the hardest possible task and disastrous as a bootstrap).
     """
     spec = _flat_template("RC_locomotion", max_obstacles=0)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
         r = rng.uniform()
-        if r < 0.70:
-            bearing = "front"
-            min_sep = 5.0
+        if r < 0.50:
+            bearing, dmin, dmax = "front", 2.0, 4.0
+        elif r < 0.75:
+            bearing, dmin, dmax = "front", 4.0, 7.0
         elif r < 0.90:
-            bearing = "side"
-            min_sep = 5.0
+            bearing, dmin, dmax = "side", 4.0, 7.0
         else:
-            bearing = "behind"
-            min_sep = 4.0
+            # Hardest slice: full bearing mix at longer distances.
+            r2 = rng.uniform()
+            bearing = "front" if r2 < 0.5 else ("side" if r2 < 0.85 else "behind")
+            dmin, dmax = 5.0, 10.0
         start, yaw, goal = sample_start_goal_pair(
-            rng, arena_half=12.0, min_separation=min_sep, margin=2.0,
-            relative_bearing=bearing,
+            rng, arena_half=12.0, min_separation=dmin, max_separation=dmax,
+            margin=2.0, relative_bearing=bearing,
         )
         return TerrainRoll(
             start_pos=start, start_yaw=yaw, goal_pos=goal,
@@ -1102,17 +1114,31 @@ def terrain_RC_path_following(seed: int = 0) -> TerrainSpec:
         15% 2 waypoints on an arc (sweep 30°–90°, sign random)
         15% 4–5 slalom waypoints (swing 1.5–3.0 m)
 
-    Mixed with 15% manoeuvre starts (side/behind cones) so the policy can't
-    just learn "always start moving forward".
+    Distance curriculum (orthogonal to chain config):
+        40% short paths  (start-goal distance 4–6 m)  — bootstrap waypoint
+                                                        bonus discovery
+        60% long paths   (start-goal distance 6–10 m) — generalisation
+
+    The short slice lets PPO hit waypoint bonuses (+20) and goal bonuses
+    (+50) often during the first ~100k steps — without it, the same
+    bootstrap problem as phase 0 hits at the waypoint level.
+
+    Mixed with 15% manoeuvre starts (side/behind cones) so the policy
+    can't just learn "always start moving forward".
     """
     spec = _flat_template("RC_path_following", max_obstacles=0)
 
     def _roll(rng: np.random.Generator) -> TerrainRoll:
+        # Distance band: 40% short, 60% long.
+        if rng.uniform() < 0.40:
+            dmin, dmax = 4.0, 6.0
+        else:
+            dmin, dmax = 6.0, 10.0
         # Start orientation: 85% forward, 15% manoeuvre.
         bearing = "uniform" if rng.uniform() < 0.85 else "maneuver"
         start, yaw, goal = sample_start_goal_pair(
-            rng, arena_half=12.0, min_separation=7.0, margin=2.0,
-            relative_bearing=bearing,
+            rng, arena_half=12.0, min_separation=dmin, max_separation=dmax,
+            margin=2.0, relative_bearing=bearing,
         )
         r = rng.uniform()
         if r < 0.25:
