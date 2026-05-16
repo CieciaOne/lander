@@ -18,6 +18,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
+# MJX (MuJoCo XLA) GPU-accelerated rollout backend. `mujoco-mjx` is a
+# separate PyPI package even though it lives under `mujoco.mjx` at
+# import time; it's not pulled in by the base `mujoco` install.
+# Use `pip install -e ".[mjx]"` on a CUDA-capable Linux box, then add
+# `pip install -U "jax[cuda12]"` to point JAX at the GPU.
+mjx = ["mujoco-mjx>=3.5.0,<4.0.0", "jax>=0.4.30", "flax>=0.8.0"]
 
 [tool.poetry]
 packages = [{ include = "rover_cl", from = "src" }]
