@@ -256,7 +256,9 @@ def main() -> None:
                     help="Path to a YAML mission config. When set, --cl-method, "
                          "--train-steps, --seed, --seeds, and the positional "
                          "scenario are ignored.")
-    ap.add_argument("--cl-method", default="naive", choices=["naive", "replay", "ewc"])
+    ap.add_argument("--cl-method", default="naive",
+                    choices=["naive", "replay", "ewc", "hybrid",
+                             "l2", "mas", "distill"])
     ap.add_argument("--train-steps", type=int, default=100_000,
                     help="PPO timesteps per task. 30k learns ~nothing on this env, "
                          "100k gives a usable signal, 300k–1M is research-quality.")

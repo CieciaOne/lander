@@ -487,6 +487,117 @@ def scenario_11_robust_generalist(
     )
 
 
+def scenario_12_joint_training(
+    cl_method: str = "naive",
+    train_timesteps: int = 5_000_000,
+    eval_episodes: int = 20,
+    max_steps: int = 1500,
+    seed: int = 0,
+) -> Mission:
+    """Joint-training baseline — train PPO directly on RC_full_random.
+
+    No curriculum, no continual-learning protection. Just sample from the
+    full distribution every batch. This is the joint-training upper bound
+    that all CL methods in the thesis are compared against, AND the most
+    practical deployable >90% policy candidate.
+
+    `cl_method` defaults to 'naive' (no CL machinery — there's nothing to
+    protect across phases, only one phase). The Runner still creates the
+    CL object but it just trains PPO normally.
+
+    Default budget: 5M timesteps. With --n-envs 6 on M3 Air, ~6-12 hours
+    wall-clock per seed.
+    """
+    tasks = [
+        _make_task(
+            "RC_full_random",
+            train_timesteps,
+            eval_episodes, max_steps,
+            ent_coef=0.02,
+            # No advance gate (only one phase, nothing to advance to).
+            min_success_to_advance=None,
+            # Interim eval every 100k so we can watch the learning curve
+            # without polluting the log.
+            interim_eval_every=100_000,
+            interim_eval_episodes=10,
+        )
+    ]
+    return Mission(
+        name=f"scenario_12_joint_training_{cl_method}",
+        tasks=tasks,
+        cl_method=cl_method,
+        cl_kwargs={},
+        seed=seed,
+    )
+
+
+def scenario_13_integrated_curriculum(
+    cl_method: str = "ewc",
+    train_timesteps: int = 600_000,
+    eval_episodes: int = 12,
+    max_steps: int = 1500,
+    seed: int = 0,
+    ewc_lam: float = 400.0,
+    enable_gate: bool = True,
+    enable_interim_eval: bool = True,
+) -> Mission:
+    """4-phase INTEGRATED curriculum.
+
+    Headline difference vs scenario_11: no phase trains a single skill
+    in isolation. After the locomotion-bootstrap foundation, every phase
+    has obstacles AND waypoints in EVERY episode. The CL method's job
+    becomes "preserve smoothly-improving skills" instead of "preserve
+    skill A while task switches to skill B" — much easier.
+
+    Phases:
+        0. RC_foundation         — locomotion + simple paths, no obstacles.
+                                   Distance-curriculum bootstrap; 25% have
+                                   a single waypoint to gently introduce
+                                   the waypoint mechanic.
+        1. RC_navigation         — paths + obstacles together, flat ground.
+                                   Density+distance curriculum within phase.
+        2. RC_navigation_terrain — same but on a heightmap. Layered
+                                   suspension challenge.
+        3. RC_full_random        — capstone uniform draw.
+
+    Default budget: 600k base × multipliers below ≈ 3M. Adaptive gate
+    cuts easy phases short. With --n-envs 6 on M3 Air, 30-90 minutes
+    wall-clock per seed depending on how much the gate trims.
+    """
+    # Phases 1 and 2 get the bulk of the budget because they're where
+    # the integrated skills are actually learned.
+    phase_plan: list[tuple[str, float, float | None, float | None]] = [
+        ("RC_foundation",          1.0, None,  0.70),
+        ("RC_navigation",          2.0, 0.02,  0.45),
+        ("RC_navigation_terrain",  1.5, 0.02,  0.40),
+        ("RC_full_random",         2.0, 0.02,  None),
+    ]
+    cl_kwargs: dict = {"lam": ewc_lam} if cl_method == "ewc" else {}
+    interim_every = 50_000 if enable_interim_eval else 0
+
+    tasks = []
+    for terrain, mult, ec, threshold in phase_plan:
+        tasks.append(_make_task(
+            terrain,
+            int(train_timesteps * mult),
+            eval_episodes, max_steps,
+            ent_coef=ec,
+            min_success_to_advance=threshold if enable_gate else None,
+            max_budget_multiplier=2.0,
+            gate_check_interval=50_000,
+            gate_eval_episodes=8,
+            interim_eval_every=interim_every,
+            interim_eval_episodes=5,
+        ))
+    return Mission(
+        name=f"scenario_13_integrated_curriculum_{cl_method}",
+        tasks=tasks,
+        cl_method=cl_method,
+        cl_kwargs=cl_kwargs,
+        seed=seed,
+    )
+
+
 def scenario_02_threat_classes(**_kwargs) -> Mission:
     """Scenario 2 (threat classification track) — NOT YET IMPLEMENTED.
 
@@ -525,6 +636,8 @@ SCENARIO_REGISTRY = {
     "scenario_09_curriculum_arc": scenario_09_curriculum_arc,
     "scenario_10_robust_curriculum": scenario_10_robust_curriculum,
     "scenario_11_robust_generalist": scenario_11_robust_generalist,
+    "scenario_12_joint_training": scenario_12_joint_training,
+    "scenario_13_integrated_curriculum": scenario_13_integrated_curriculum,
     # Stubs (raise NotImplementedError on call but registered so they're discoverable):
     "scenario_02_threat_classes": scenario_02_threat_classes,
     "scenario_06_fusion": scenario_06_fusion,

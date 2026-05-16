@@ -1525,6 +1525,187 @@ def terrain_RC_full_random(seed: int = 0) -> TerrainSpec:
     return spec
 
 
+# ---------------------------------------------------------------------------
+# scenario_13 integrated curriculum (RC_foundation/navigation/...).
+#
+# The scenario_11 curriculum had pure single-skill phases (path-only, then
+# obstacle-only). The transition from "no obstacles" to "many obstacles"
+# wiped path-following — exactly the catastrophic-forgetting failure mode
+# CL is supposed to mitigate, but more than EWC alone can recover from.
+#
+# Design principle here: NO phase trains a single skill in isolation.
+# Every phase after the foundation has obstacles AND waypoints in every
+# episode. The CL method's job becomes "preserve smoothly improving
+# skills" rather than "preserve skill A while task switches to skill B".
+# ---------------------------------------------------------------------------
+
+
+def terrain_RC_foundation(seed: int = 0) -> TerrainSpec:
+    """Phase 0 of the integrated curriculum: locomotion + simple paths.
+
+    Within-phase mix:
+        50% short goal, 0 waypoints   (2-4 m)  — locomotion bootstrap
+        25% medium goal, 0 waypoints  (4-7 m)  — extended driving
+        25% short goal, 1 waypoint    (3-6 m total) — light path follow
+
+    Distance-curriculum bootstrap (same trick that worked on RC_locomotion).
+    The 25% one-waypoint slice introduces the waypoint mechanic gently so
+    the next phase doesn't see it for the first time.
+    """
+    spec = _flat_template("RC_foundation", max_obstacles=0)
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        r = rng.uniform()
+        if r < 0.50:
+            dmin, dmax, has_wp = 2.0, 4.0, False
+            bearing = "front"
+        elif r < 0.75:
+            dmin, dmax, has_wp = 4.0, 7.0, False
+            bearing = "front" if rng.uniform() < 0.75 else "side"
+        else:
+            dmin, dmax, has_wp = 3.0, 6.0, True
+            bearing = "uniform"
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=dmin, max_separation=dmax,
+            margin=2.0, relative_bearing=bearing,
+        )
+        wps = (
+            sample_waypoints_between(rng, start, goal, n_waypoints=1, lateral_jitter=0.6)
+            if has_wp else ()
+        )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal,
+            waypoints=wps,
+            obstacle_positions=[], obstacle_sizes=[],
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_navigation(seed: int = 0) -> TerrainSpec:
+    """Phase 1: integrated path+obstacle navigation on flat ground.
+
+    EVERY episode has BOTH waypoints AND obstacles. The "skills together
+    from day one" principle — never train obstacle avoidance without
+    something to reach, never train path following without something
+    to avoid. This is the headline change vs scenario_11.
+
+    Within-phase difficulty mix:
+        30%  1 obstacle, 0-1 waypoint, short (3-5 m)
+        30%  1-2 obstacles, 1 waypoint, medium (4-7 m)
+        25%  2-3 obstacles, 1-2 waypoints, medium (5-8 m)
+        15%  3-5 obstacles, 2 waypoints, longer (6-9 m)
+    """
+    spec = _flat_template("RC_navigation", max_obstacles=5,
+                          ground_rgba=(0.58, 0.42, 0.30, 1.0))
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        r = rng.uniform()
+        if r < 0.30:
+            n_obs, dmin, dmax = 1, 3.0, 5.0
+            n_wp = 0 if rng.uniform() < 0.5 else 1
+        elif r < 0.60:
+            n_obs, dmin, dmax = int(rng.integers(1, 3)), 4.0, 7.0
+            n_wp = 1
+        elif r < 0.85:
+            n_obs, dmin, dmax = int(rng.integers(2, 4)), 5.0, 8.0
+            n_wp = int(rng.integers(1, 3))
+        else:
+            n_obs, dmin, dmax = int(rng.integers(3, 6)), 6.0, 9.0
+            n_wp = 2
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=dmin, max_separation=dmax,
+            margin=2.0,
+        )
+        if n_wp > 0:
+            wps = sample_waypoints_between(
+                rng, start, goal, n_waypoints=n_wp, lateral_jitter=0.9,
+            )
+        else:
+            wps = ()
+        pos, sz = sample_obstacles_along_path(
+            rng, start, goal,
+            n_obstacles=n_obs, max_slots=5,
+            size_range=(0.4, 0.6), lateral_jitter=1.3,
+        )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
+            obstacle_positions=pos, obstacle_sizes=sz,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_navigation_terrain(seed: int = 0) -> TerrainSpec:
+    """Phase 2: phase 1 + heightmap. Same skill mix, varied terrain.
+
+    All paths/obstacles like RC_navigation, layered on:
+        30% essentially flat   (hfield × 0.04)
+        50% gentle hills       (hfield × 0.4)
+        20% bigger dunes       (hfield × 0.8)
+
+    Obstacles sit on the local terrain surface.
+    """
+    spec = _hfield_template(
+        "RC_navigation_terrain", max_obstacles=5,
+        elevation_z=0.5, hm_seed=seed,
+        ground_rgba=(0.62, 0.46, 0.34, 1.0),
+    )
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        # Same path+obstacle distribution as RC_navigation.
+        r = rng.uniform()
+        if r < 0.30:
+            n_obs, dmin, dmax = 1, 3.0, 5.0
+            n_wp = 0 if rng.uniform() < 0.5 else 1
+        elif r < 0.60:
+            n_obs, dmin, dmax = int(rng.integers(1, 3)), 4.0, 7.0
+            n_wp = 1
+        elif r < 0.85:
+            n_obs, dmin, dmax = int(rng.integers(2, 4)), 5.0, 8.0
+            n_wp = int(rng.integers(1, 3))
+        else:
+            n_obs, dmin, dmax = int(rng.integers(3, 6)), 6.0, 9.0
+            n_wp = 2
+
+        # Terrain scale mix.
+        tr = rng.uniform()
+        hm = generate_heightmap_perlin(
+            nrow=48, ncol=48, scale=0.10, octaves=3,
+            seed=int(rng.integers(0, 10_000_000)),
+        )
+        if tr < 0.30:
+            hm = hm * 0.04
+        elif tr < 0.80:
+            hm = hm * 0.40
+        else:
+            hm = hm * 0.80
+
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=11.0, min_separation=dmin, max_separation=dmax,
+            margin=2.5,
+        )
+        if n_wp > 0:
+            wps = sample_waypoints_between(
+                rng, start, goal, n_waypoints=n_wp, lateral_jitter=0.9,
+            )
+        else:
+            wps = ()
+        pos, sz = sample_obstacles_along_path(
+            rng, start, goal,
+            n_obstacles=n_obs, max_slots=5,
+            size_range=(0.4, 0.6), lateral_jitter=1.3,
+            heightmap=hm, heightmap_extent=(11.0, 11.0, 0.5),
+        )
+        return TerrainRoll(
+            start_pos=start, start_yaw=yaw, goal_pos=goal, waypoints=wps,
+            obstacle_positions=pos, obstacle_sizes=sz,
+            heightmap=hm,
+        )
+    spec.randomize_on_reset = _roll
+    return spec
+
+
 TERRAIN_CATALOG: dict[str, TerrainFactory] = {
     "T1_flat": terrain_T1_flat,
     "T1_blocked_arc": terrain_T1_blocked_arc,
@@ -1555,6 +1736,10 @@ TERRAIN_CATALOG: dict[str, TerrainFactory] = {
     "RC_terrain":             terrain_RC_terrain,
     "RC_terrain_plus":        terrain_RC_terrain_plus,
     "RC_full_random":         terrain_RC_full_random,
+    # scenario_13 integrated curriculum (no-pure-single-skill phases):
+    "RC_foundation":          terrain_RC_foundation,
+    "RC_navigation":          terrain_RC_navigation,
+    "RC_navigation_terrain":  terrain_RC_navigation_terrain,
 }
 
 
