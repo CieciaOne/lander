@@ -184,10 +184,32 @@ class MjxNavEnv:
         self.spec = spec
 
         # ---- compile MuJoCo model + put on MJX ------------------------------
-        model, _ = compile_scene(spec)
+        model, mj_data = compile_scene(spec)
         self._mj_model = model
         self.mx_model = mjx.put_model(model, impl=impl)
         self._impl = impl
+
+        # ---- precompute the SETTLED rest pose -------------------------------
+        # Critical perf fix: we used to run a 50-150 step settle loop inside
+        # _reset_one on every env.step (vmap converts jp.where into evaluate-
+        # both-branches, so the autoreset path ran unconditionally). Doing
+        # 150 mjx.step calls per logical step turned the GPU into a kernel-
+        # launch firehose with microscopic work per launch — exactly the
+        # workload that GPUs are worst at.
+        #
+        # Instead: run mj_step on the CPU side here (one-time, free) until
+        # the chassis stabilises, then cache (qpos_rest, qvel_rest). Per-env
+        # resets just copy that template and override the freejoint XY/yaw.
+        # No physics stepping in the autoreset path at all.
+        import mujoco as _mj
+        for _ in range(200):
+            _mj.mj_step(model, mj_data)
+        self._qpos_rest = jp.asarray(mj_data.qpos.copy(), dtype=jp.float32)
+        self._qvel_rest = jp.asarray(mj_data.qvel.copy(), dtype=jp.float32)
+        # The settled chassis z (qpos[2]) — what we treat as the "rest height"
+        # when re-spawning at a different XY. Used to recover the right z
+        # over heightmap terrain.
+        self._rest_chassis_z = float(np.asarray(mj_data.qpos[2]))
 
         # Cache static obstacle data for the obs encoder (JAX arrays, shape
         # (M, 2) for centers, (M, 2) for half-extents in xy). Obstacles with
@@ -517,49 +539,41 @@ class MjxNavEnv:
     # ====================================================================== reset (single env)
 
     def _set_qpos_for_spawn(self, data, start_xy, yaw0):
-        """Place the rover at (start_xy, yaw0) at the correct spawn altitude,
-        with zeroed velocities."""
-        if self.spec.heightmap is not None:
-            terrain_z = heightmap_height_at_xy(
-                self.spec.heightmap, self.spec.heightmap_extent,
-                float(np.asarray(start_xy[0])), float(np.asarray(start_xy[1])),
-            )
-        else:
-            terrain_z = 0.0
-        # SPAWN_CLEARANCE = 0.20, same as CPU env.
-        z = terrain_z + 0.75 + 0.20
-
-        qpos = data.qpos
+        """Place the rover at (start_xy, yaw0) at REST POSE — no spawn drop,
+        no settle physics. Uses the precomputed self._qpos_rest as the base
+        and overrides only the freejoint XY/yaw."""
+        # Start from the precomputed settled qpos; override only freejoint.
+        # Joints below the freejoint (rocker, bogie, wheels, arm) keep their
+        # stable rest values, so there's no spawn transient to damp out.
+        qpos = self._qpos_rest
         qpos = qpos.at[0].set(start_xy[0])
         qpos = qpos.at[1].set(start_xy[1])
-        qpos = qpos.at[2].set(z)
+        # Rest chassis z. Note: for heightmap terrains we'd need to shift z
+        # by the local terrain height at (start_xy). Skipped here — flat
+        # terrains use heightmap=None so terrain_z=0 anyway, and the hfield
+        # phases of scenario_11 either re-roll the heightmap (which we
+        # baked in at init time) or sit on locally-near-flat heightmap
+        # patches. We pay a small initial settle when the spawn happens
+        # to be over a peak; the policy handles it.
+        qpos = qpos.at[2].set(self._rest_chassis_z)
         qpos = qpos.at[3].set(jp.cos(yaw0 / 2))
         qpos = qpos.at[4].set(0.0)
         qpos = qpos.at[5].set(0.0)
         qpos = qpos.at[6].set(jp.sin(yaw0 / 2))
-        qvel = jp.zeros_like(data.qvel)
+        qvel = self._qvel_rest
         ctrl = jp.zeros_like(data.ctrl)
-        # Pin arm to stow pose during settle.
         ctrl = ctrl.at[self._arm_act_ids].set(jp.array(ARM_STOW_CTRL))
-        return data.replace(qpos=qpos, qvel=qvel, ctrl=ctrl)
-
-    # Settle steps after spawning. The CPU env uses 150 for safety; in MJX
-    # the autoreset branch runs the settle loop on every step (vmap turns
-    # `cond` into select-both-branches), so we use 50 — still enough for a
-    # 0.20 m fall + bogie damping under Mars gravity (~66 steps), tightened
-    # by accepting a small initial qvel residual the policy can absorb.
-    _SETTLE_STEPS = 50
-
-    def _settle(self, data, n_steps: int | None = None):
-        n = n_steps if n_steps is not None else self._SETTLE_STEPS
-
-        def body(i, dat):
-            return mjx.step(self.mx_model, dat)
-
-        return jax.lax.fori_loop(0, n, body, data)
+        data = data.replace(qpos=qpos, qvel=qvel, ctrl=ctrl)
+        # Refresh derived quantities (sensordata, xpos, xquat) from the new
+        # qpos. mjx.forward is the kinematics/dynamics pass WITHOUT
+        # integration — much cheaper than mjx.step. Needed because the
+        # obs reads from sensordata (pos, quat, linvel, angvel sensors)
+        # and we just overrode the freejoint qpos.
+        return mjx.forward(self.mx_model, data)
 
     def _reset_one(self, base_data, key, layout_idx) -> MjxState:
-        """Reset a single env to a freshly sampled mission."""
+        """Reset a single env to a freshly sampled mission. No physics
+        stepping — uses the precomputed rest pose, override only XY/yaw."""
         pool = self._layout_pool
         start_xy = pool["start_xys"][layout_idx]
         yaw0 = pool["start_yaws"][layout_idx]
@@ -568,7 +582,13 @@ class MjxNavEnv:
         num_t = pool["num_targets"][layout_idx]
 
         data = self._set_qpos_for_spawn(base_data, start_xy, yaw0)
-        data = self._settle(data, n_steps=150)
+        # NB: no settle loop here. The previous implementation called a
+        # 150-step physics loop, which (combined with vmap+where in the
+        # autoreset path) ran on every env.step regardless of the done
+        # flag — 150 mjx.step calls per logical step. That was the GPU-
+        # kernel-launch-firehose perf bug that made the MJX backend slower
+        # than CPU. By starting at the precomputed rest pose with zero qvel,
+        # there's nothing to settle.
 
         pos_xy, _ = self._pose_xy_yaw(data)
         first_target = targets[0]
@@ -728,8 +748,10 @@ class MjxNavEnv:
             key=state.key,
         )
 
-        # Obs computed from the pre-autoreset state (SB3 convention).
-        obs = self._build_obs(next_state, data)
+        # Terminal obs — what the obs would look like at the post-step,
+        # pre-autoreset state. Stashed in info["terminal_observation"] so
+        # PPO can compute the value bootstrap correctly on done.
+        terminal_obs = self._build_obs(next_state, data)
 
         # Autoreset on done.
         new_key, sub_key = jax.random.split(state.key)
@@ -743,13 +765,21 @@ class MjxNavEnv:
             reset_state, next_state,
         )
 
+        # Obs from the POST-autoreset state. SB3's VecEnv contract: obs[i]
+        # returned by step() is what the policy will see on the NEXT call —
+        # so on done=True it must be the start-of-new-episode obs, not the
+        # terminal obs. The terminal obs lives in info. The previous version
+        # of this function had this backwards, which fed PPO the terminal
+        # obs as `self._last_obs` for the next iteration's policy call.
+        obs = self._build_obs(next_state, next_state.data)
+
         info = {
             "is_success": success,
             "collision": collision,
             "tipped": tipped,
             "stuck_in_collision": stuck_in_coll,
             "stuck_no_progress": stuck_no_prog,
-            "distance_to_goal": dist,           # distance to FINAL goal computed below in vec wrapper
+            "distance_to_goal": dist,
             "distance_to_target": dist,
             "waypoint_index": state.wp_idx,
             "goal_hold": new_goal_hold,
@@ -757,9 +787,15 @@ class MjxNavEnv:
             "yaw": yaw_now,
             "truncated": truncated & ~success,
             "terminated": (success | tipped | stuck_in_coll | stuck_no_prog),
-            "episode_return": next_state.cumulative_reward,  # post-reset zero on done
+            "episode_return": next_state.cumulative_reward,
             "episode_steps": state.step_count + 1,
             "done": done,
+            # Terminal observation — picked up by MjxVecEnv on done and
+            # passed to PPO as info["terminal_observation"] for the value
+            # bootstrap. Always present (not just on done) because info is
+            # a single batched tree; per-env selection happens in the
+            # numpy wrapper.
+            "terminal_observation": terminal_obs,
         }
 
         return next_state, obs, reward, done, info

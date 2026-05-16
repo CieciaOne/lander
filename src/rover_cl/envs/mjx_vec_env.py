@@ -96,10 +96,19 @@ class MjxVecEnv(VecEnv):
         reward_np = np.asarray(reward).astype(np.float32)
         done_np = np.asarray(done).astype(bool)
 
+        # Pull `terminal_observation` out — it's a (N, obs_dim) array, not
+        # a per-env scalar — so it needs special-cased conversion.
+        terminal_obs_jax = info_jax.pop("terminal_observation", None)
+
         # Convert JAX info dict to per-env Python dicts. SB3 expects info as
-        # a list of dicts (length = num_envs).
+        # a list of dicts (length = num_envs). Bulk device_get once, not
+        # one np.asarray per key (each of those is a separate sync point).
         info_keys = list(info_jax.keys())
-        info_arrays = {k: np.asarray(info_jax[k]) for k in info_keys}
+        info_arrays = jax.device_get(info_jax)   # one sync, everything moves at once
+
+        terminal_obs_np = (
+            np.asarray(terminal_obs_jax) if terminal_obs_jax is not None else None
+        )
 
         self._py_step_count += 1
         self._py_cum_reward += reward_np
@@ -111,15 +120,16 @@ class MjxVecEnv(VecEnv):
                 v = info_arrays[k]
                 inf[k] = v[i].item() if v.ndim == 1 else tuple(v[i].tolist())
             # SB3 convention on done transitions:
-            #   - return the POST-reset obs (already the case — MjxNavEnv
-            #     autoresets and returns the post-reset obs for done envs)
-            #   - put the terminal obs in info["terminal_observation"]
-            #   - put an "episode" dict for Monitor / EpisodeCounter
+            #   - obs[i] in the return is the POST-reset obs (env autoresets)
+            #   - info[i]["terminal_observation"] is the actual terminal obs
+            #     (used for PPO's value bootstrap)
+            #   - info[i]["episode"] is the Monitor-style summary
             if done_np[i]:
-                inf["terminal_observation"] = (
-                    self._last_obs_np[i].copy() if self._last_obs_np is not None
-                    else obs_np[i].copy()
-                )
+                if terminal_obs_np is not None:
+                    inf["terminal_observation"] = terminal_obs_np[i].copy()
+                else:
+                    # Fallback (shouldn't happen with current MjxNavEnv).
+                    inf["terminal_observation"] = obs_np[i].copy()
                 inf["episode"] = {
                     "r": float(self._py_cum_reward[i]),
                     "l": int(self._py_step_count[i]),
