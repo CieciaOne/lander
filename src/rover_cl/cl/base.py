@@ -27,6 +27,15 @@ DEFAULT_PPO_KWARGS: dict[str, Any] = {
     # so it keeps exploring alternatives instead of collapsing to "drive
     # forward and freeze" — that local optimum was eating the chart.
     "ent_coef": 0.01,
+    # Force PPO's policy onto CPU. For our [128, 128] MLP, kernel-launch
+    # overhead from running on GPU exceeds the compute saving, AND it would
+    # add CPU↔GPU memcpys per step on the MJX backend (obs comes off the
+    # JAX device as numpy → would have to copy to CUDA for the policy
+    # forward, then action back to CPU for the env). Keeping the policy
+    # on CPU means JAX uses the GPU exclusively and PyTorch uses the CPU
+    # exclusively — no cross-device traffic. Also silences the SB3 warning
+    # "PPO on GPU is primarily intended to run on CPU when not using a CNN".
+    "device": "cpu",
     "verbose": 0,
 }
 
