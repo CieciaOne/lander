@@ -11,33 +11,26 @@ The strongest practical CL approach for our setting. Combines:
     back toward `theta_star` so the new PPO update doesn't drift too far
     on parameters important to past tasks.
 
-The two methods are complementary:
-  - Replay supplies the gradient signal "what did the policy used to do",
-    via concrete (obs, action) pairs.
-  - EWC supplies the weight-space prior "don't move these parameters far",
-    via Fisher-weighted L2.
-
-Empirically, hybrid usually retains 1.5-2x better than either alone on
-multi-phase RL curricula.
-
-Implementation note: rather than multiple inheritance, we keep one
-HybridEwcReplayCL class that owns both pieces of state (Fisher + buffers)
-and applies both at the right points in the train_on / post_train cycle.
+The implementation reuses EwcCL's and ReplayCL's helper methods via
+Python's unbound-method assignment — no new abstraction layer, just
+function reuse. The helpers operate on `self`, accessing whichever
+attribute set this class owns (we own both `fisher`/`theta_star` and
+`buffers`).
 """
 
 from __future__ import annotations
 
-import random
 from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
-import numpy as np
 import torch as th
 
 from .base import BaseCLMethod
 from .ewc import EwcCL
 from .replay import ReplayCL, Transition, _TaskBuffer
+
+import numpy as np
 
 
 class HybridEwcReplayCL(BaseCLMethod):
@@ -77,7 +70,20 @@ class HybridEwcReplayCL(BaseCLMethod):
         self.buffers: dict[str, _TaskBuffer] = {}
         self.last_rehearsal_steps_run: int = 0
 
-    # ====================================================================== main entry
+    # ---- helper methods reused from EwcCL and ReplayCL --------------------
+    # These are plain function bodies that take self as their first arg.
+    # Assigning them at class level lets us reuse the implementations
+    # without inheriting either class (which would mess with __init__
+    # chains and post_train semantics). Not a new abstraction — just
+    # Python's normal way to share method implementations.
+    _snapshot_params = EwcCL._snapshot_params
+    _apply_ewc_penalty = EwcCL._apply_ewc_penalty
+    _collect_fisher = EwcCL._collect_fisher
+    _rehearse = ReplayCL._rehearse
+    _sample_mixed_batch = ReplayCL._sample_mixed_batch
+    _collect_into_buffer = ReplayCL._collect_into_buffer
+
+    # ---- main entry ------------------------------------------------------
 
     def train_on(
         self,
@@ -95,7 +101,6 @@ class HybridEwcReplayCL(BaseCLMethod):
         past_ids = [tid for tid in self.buffers if tid != task_id]
 
         # 1) BEFORE PPO learn: replay rehearsal on past tasks.
-        #    Anchors the policy to past-task behaviour at the boundary.
         if past_ids:
             self._rehearse(past_ids)
         else:
@@ -116,8 +121,6 @@ class HybridEwcReplayCL(BaseCLMethod):
             self.model.ent_coef = _ent_restore
 
         # 3) AFTER PPO learn: EWC penalty pull-back on past tasks.
-        #    Counteracts any drift the new PPO update introduced on
-        #    parameters Fisher-flagged as important to old tasks.
         ewc_past_ids = [tid for tid in self.fisher if tid != task_id]
         if ewc_past_ids:
             self._apply_ewc_penalty(ewc_past_ids)
@@ -132,195 +135,12 @@ class HybridEwcReplayCL(BaseCLMethod):
             self.post_train(env, task_id)
 
     def post_train(self, env: gym.Env, task_id: str) -> None:
-        # Collect replay buffer first (uses deterministic policy), then
-        # Fisher (uses stochastic policy). Order doesn't matter for state
-        # consistency since both just READ the env + policy; the policy's
-        # parameters aren't modified by either.
+        # Buffer collection uses deterministic policy; Fisher uses
+        # stochastic policy. Both just READ env + policy — order doesn't
+        # affect state.
         self._collect_into_buffer(env, task_id)
         self.fisher[task_id] = self._collect_fisher(env, self.fisher_sample_size)
         self.theta_star[task_id] = self._snapshot_params()
-
-    # ====================================================================== EWC bits
-
-    def _snapshot_params(self) -> dict[str, th.Tensor]:
-        assert self.model is not None
-        return {
-            n: p.detach().clone()
-            for n, p in self.model.policy.named_parameters()
-            if p.requires_grad
-        }
-
-    def _apply_ewc_penalty(self, past_ids: list[str]) -> None:
-        # Same as EwcCL._apply_ewc_penalty.
-        assert self.model is not None
-        policy = self.model.policy
-        params = [p for p in policy.parameters() if p.requires_grad]
-        penalty_opt = th.optim.SGD(params, lr=self.penalty_lr)
-
-        steps_done = 0
-        for _ in range(self.penalty_steps):
-            penalty_opt.zero_grad()
-            penalty = th.zeros((), device=policy.device)
-            for tid in past_ids:
-                fisher_tid = self.fisher[tid]
-                theta_tid = self.theta_star[tid]
-                for n, p in policy.named_parameters():
-                    if not p.requires_grad or n not in fisher_tid:
-                        continue
-                    f = fisher_tid[n]
-                    ts = theta_tid[n]
-                    penalty = penalty + (f * (p - ts) ** 2).sum()
-            loss = 0.5 * self.lam * penalty
-            loss.backward()
-            if self.penalty_grad_clip > 0:
-                th.nn.utils.clip_grad_norm_(params, self.penalty_grad_clip)
-            penalty_opt.step()
-            steps_done += 1
-        self.last_penalty_steps_run = steps_done
-
-    def _collect_fisher(
-        self, env: gym.Env, n_samples: int
-    ) -> dict[str, th.Tensor]:
-        # Same as EwcCL._collect_fisher.
-        assert self.model is not None
-        policy = self.model.policy
-        device = policy.device
-
-        fisher = {
-            n: th.zeros_like(p, device=device)
-            for n, p in policy.named_parameters()
-            if p.requires_grad
-        }
-
-        n_samples = max(1, int(n_samples))
-        obs, _info = env.reset()
-        collected = 0
-        max_iters = n_samples * 10
-        for _ in range(max_iters):
-            if collected >= n_samples:
-                break
-            action, _ = self.model.predict(obs, deterministic=False)
-            obs_t = th.as_tensor(
-                np.asarray(obs, dtype=np.float32), dtype=th.float32, device=device
-            ).unsqueeze(0)
-            act_t = th.as_tensor(
-                np.asarray(action, dtype=np.float32), dtype=th.float32, device=device
-            ).unsqueeze(0)
-
-            policy.zero_grad()
-            _values, log_prob, _entropy = policy.evaluate_actions(obs_t, act_t)
-            loss = -log_prob.mean()
-            loss.backward()
-
-            for n, p in policy.named_parameters():
-                if p.grad is None or n not in fisher:
-                    continue
-                fisher[n] = fisher[n] + p.grad.detach() ** 2
-
-            step_out = env.step(action)
-            if len(step_out) == 5:
-                next_obs, _reward, terminated, truncated, _info = step_out
-                done = bool(terminated or truncated)
-            else:  # pragma: no cover
-                next_obs, _reward, done, _info = step_out  # type: ignore[misc]
-
-            collected += 1
-            if done:
-                obs, _info = env.reset()
-            else:
-                obs = next_obs
-
-        policy.zero_grad()
-        denom = float(max(collected, 1))
-        for n in list(fisher.keys()):
-            fisher[n] = (fisher[n] / denom).detach()
-        return fisher
-
-    # ====================================================================== Replay bits
-
-    def _rehearse(self, past_ids: list[str]) -> None:
-        # Same as ReplayCL._rehearse.
-        assert self.model is not None
-        policy = self.model.policy
-        optimizer = policy.optimizer
-        device = policy.device
-
-        original_lrs = [g["lr"] for g in optimizer.param_groups]
-        for g in optimizer.param_groups:
-            g["lr"] = g["lr"] * self.rehearsal_lr_scale
-
-        steps_done = 0
-        try:
-            for _ in range(self.rehearsal_steps):
-                batch = self._sample_mixed_batch(past_ids, self.rehearsal_batch_size)
-                if batch is None:
-                    break
-                obs_np, act_np = batch
-                obs_t = th.as_tensor(obs_np, dtype=th.float32, device=device)
-                act_t = th.as_tensor(act_np, dtype=th.float32, device=device)
-
-                _values, log_prob, _entropy = policy.evaluate_actions(obs_t, act_t)
-                loss = -log_prob.mean()
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                steps_done += 1
-        finally:
-            for g, lr in zip(optimizer.param_groups, original_lrs):
-                g["lr"] = lr
-
-        self.last_rehearsal_steps_run = steps_done
-
-    def _sample_mixed_batch(
-        self, past_ids: list[str], batch_size: int
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        pool: list[Transition] = []
-        for tid in past_ids:
-            pool.extend(self.buffers[tid].items)
-        if not pool:
-            return None
-        picks = random.choices(pool, k=batch_size)
-        obs = np.stack([p.obs for p in picks]).astype(np.float32)
-        actions = np.stack([np.asarray(p.action) for p in picks]).astype(np.float32)
-        return obs, actions
-
-    def _collect_into_buffer(self, env: gym.Env, task_id: str) -> None:
-        # Same as ReplayCL._collect_into_buffer.
-        assert self.model is not None
-        buf = self.buffers.setdefault(
-            task_id, _TaskBuffer(capacity=self.buffer_size_per_task)
-        )
-        target = self.buffer_size_per_task
-
-        obs, _info = env.reset()
-        collected = 0
-        max_iters = target * 10
-        for _ in range(max_iters):
-            if collected >= target:
-                break
-            action, _ = self.model.predict(obs, deterministic=True)
-            step_out = env.step(action)
-            if len(step_out) == 5:
-                next_obs, reward, terminated, truncated, _info = step_out
-                done = bool(terminated or truncated)
-            else:  # pragma: no cover
-                next_obs, reward, done, _info = step_out  # type: ignore[misc]
-            buf.add(
-                Transition(
-                    obs=np.asarray(obs, dtype=np.float32).copy(),
-                    action=np.asarray(action, dtype=np.float32).copy(),
-                    reward=float(reward),
-                    next_obs=np.asarray(next_obs, dtype=np.float32).copy(),
-                    done=done,
-                    task_id=task_id,
-                )
-            )
-            collected += 1
-            if done:
-                obs, _info = env.reset()
-            else:
-                obs = next_obs
 
     # ====================================================================== persistence
 

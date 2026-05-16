@@ -249,6 +249,14 @@ class RoverNavEnv(gym.Env):
         self._base_linvel_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_SENSOR, "base_linvel")
         self._base_angvel_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_SENSOR, "base_angvel")
         self._base_link_body_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+        # Cache obstacle geom ids up-front. `_apply_terrain_roll` runs on
+        # every reset (~thousands per phase) and previously called
+        # mj_name2id() per obstacle per reset. The names are stable for
+        # the lifetime of a compiled model, so look them up once here.
+        self._obstacle_geom_ids: list[int] = [
+            mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, f"obs_{i}")
+            for i in range(len(terrain.obstacles))
+        ]
 
         # Cache the 4 corner-steering actuator IDs (env applies a single Ackermann
         # steer command across them: FR & FL get -steer, RR & RL get +steer —
@@ -503,7 +511,7 @@ class RoverNavEnv(gym.Env):
                 f"terrain was compiled with {n_slots} slots"
             )
         for i in range(n_slots):
-            gid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, f"obs_{i}")
+            gid = self._obstacle_geom_ids[i] if i < len(self._obstacle_geom_ids) else -1
             if gid < 0:
                 continue
             # Size is fine to mutate via model.geom_size at runtime — only the
@@ -919,5 +927,3 @@ class RoverNavEnv(gym.Env):
             self._renderer = None
 
 
-def make_env(terrain_name: str, seed: int = 0, **kwargs) -> RoverNavEnv:
-    return RoverNavEnv(terrain=terrain_name, seed=seed, **kwargs)

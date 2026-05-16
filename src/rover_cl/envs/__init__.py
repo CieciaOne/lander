@@ -1,4 +1,4 @@
-from .nav import RoverNavEnv, make_env
+from .nav import RoverNavEnv
 from .terrains import (
     Obstacle,
     TerrainSpec,
@@ -12,7 +12,6 @@ from .terrains import (
 
 __all__ = [
     "RoverNavEnv",
-    "make_env",
     "Obstacle",
     "TerrainSpec",
     "compose_scene",

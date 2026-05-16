@@ -184,19 +184,3 @@ class MjxVecEnv(VecEnv):
         return [False for _ in indices]
 
 
-def make_mjx_vec_env(
-    terrain: str,
-    n_envs: int = 64,
-    seed: int = 0,
-    max_steps: int = 500,
-    impl: str = "jax",
-    **kwargs: Any,
-) -> MjxVecEnv:
-    return MjxVecEnv(
-        terrain=terrain,
-        n_envs=n_envs,
-        seed=seed,
-        max_steps=max_steps,
-        impl=impl,
-        **kwargs,
-    )

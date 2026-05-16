@@ -834,5 +834,3 @@ class MjxNavEnv:
         return obs, reward, done, info
 
 
-def make_mjx_env(terrain: str, n_envs: int = 64, seed: int = 0, **kwargs) -> MjxNavEnv:
-    return MjxNavEnv(terrain=terrain, n_envs=n_envs, seed=seed, **kwargs)
