@@ -37,17 +37,24 @@ with a terrain.
 
 - **Action (2-D, Ackermann)**: `action[0]=throttle` drives all 6 wheels; `action[1]=steer`
   routes through 4 corner steering knuckles (FR/FL `−steer`, RR/RL `+steer`).
-- **Obs (40-D)**: 6 ego (`rel_fwd`, `rel_right`, `heading_to_target`, body-frame `linvel_x/y`,
-  `angvel_z` — all against current target) + 2 lookahead (`rel_fwd_next`, `rel_right_next`
-  to next target) + 8 obstacle slots × `(fwd_min, fwd_max, right_min, right_max)`. Each
-  obstacle's AABB is **inflated by `ROVER_FOOTPRINT_RADIUS=0.9m`** (Minkowski sum)
-  so the policy treats itself as a point against pre-inflated walls. Empty slots
-  pad with a far-diagonal sentinel.
-- **Reward**: `5.0×Δd_target` (progress) + `+20` per waypoint hit + `+50` on goal +
-  speed bonus − `0.01` step cost − collision/hit/tipped penalties − `0.1×‖Δaction‖²`
-  jerk − wheels-off penalty. Stuck-no-progress fires `-30` and ends the episode
-  if no `≥0.5m` improvement for `200` steps; stuck-in-collision fires `-5` after
-  `30` consecutive contact steps. Defaults in `RoverNavEnv.__init__`.
+- **Obs (44-D, fixed-scale normalized)**: 6 ego (`rel_fwd`, `rel_right`,
+  `heading_to_target`, body-frame `linvel_x/y`, `angvel_z` — all against current
+  target) + 2 lookahead (`rel_fwd_next`, `rel_right_next` to next target) +
+  8 obstacle slots × `(fwd_min, fwd_max, right_min, right_max)` + 2 tilt
+  (`tilt_fwd`, `tilt_right` — world-up in body frame, for hfield terrain) +
+  2 prev_action. Each obstacle's AABB is **inflated by
+  `ROVER_FOOTPRINT_RADIUS=0.9m`** (Minkowski sum) so the policy treats itself
+  as a point against pre-inflated walls. Empty slots pad with a far-diagonal
+  sentinel. The whole vector is divided by the FIXED `OBS_SCALE` constants
+  (not VecNormalize — running stats would drift across CL tasks and confound
+  the forgetting metrics).
+- **Reward**: `5.0×Δd_target` (progress) + `+10` per waypoint hit + `+50` on goal +
+  speed bonus (`scale=0.5`) − `0.01` step cost − one-shot `-5` hit penalty (per-step
+  collision penalty is 0 by default — it created a freeze-in-place optimum) −
+  tipped `-20` − `0.1×‖Δaction‖²` jerk − wheels-off penalty. Stuck-no-progress
+  fires `-30` and ends the episode if no `≥0.5m` improvement for `200` steps;
+  stuck-in-collision fires `-5` after `30` consecutive contact steps.
+  Defaults in `RoverNavEnv.__init__`.
 - **Per-reset jitter** (`±0.5m`, `±0.2rad`) so eval seeds produce different rollouts.
 - **Info dict** has `pos_xy`, `yaw`, `collision`, `is_success`, `tipped`,
   `stuck_in_collision`, `stuck_no_progress`, `distance_to_goal`, `distance_to_target`,
@@ -72,11 +79,20 @@ All live in `src/rover_cl/cl/`. Mechanism summary:
 |---|---|---|---|
 | `naive` | No protection (control) | — | — |
 | `replay` | BC rehearsal on stored (obs, action) | before PPO learn | `buffer_size_per_task` |
-| `ewc` | Fisher-weighted L2 penalty toward `θ*` | after PPO learn | `lam` |
-| `l2` | Uniform-weight L2 (Fisher=1, baseline) | after PPO learn | `lam` |
-| `mas` | Memory Aware Synapses (alt importance) | after PPO learn | `lam` |
+| `ewc` | Fisher-weighted L2 penalty toward `θ*` | **inside every PPO gradient step** (per-param grad hooks) | `lam=1000` |
+| `l2` | Uniform-weight L2 (Fisher=1, baseline) | inside every PPO gradient step | `lam=100` |
+| `mas` | Memory Aware Synapses (alt importance) | inside every PPO gradient step | `lam=5000` |
 | `distill` | KL divergence to frozen teacher | before PPO learn | `distill_kl_weight` |
-| `hybrid` | EWC + Replay together | both | `lam`, `buffer_size_per_task` |
+| `hybrid` | EWC + Replay together | rehearsal before + hooks during | `lam=400`, `buffer_size_per_task` |
+
+The EWC-family penalty is injected via `register_hook` on each protected
+parameter: the hook adds the analytic gradient `lam·F·(θ−θ*)` to every
+backward pass of PPO's loss — mathematically identical to adding the penalty
+term to the loss, no SB3 subclassing. Hooks are installed before `learn()`
+and removed after (so Fisher collection stays clean). Each `train_on` also
+records `last_penalty_value` / `last_penalty_steps_run` (surfaced in the
+Runner log as "cl diagnostics" and stored in `results.json` timings) so a
+mis-scaled `lam` is visible instead of silently corrupting the comparison.
 
 The hybrid class reuses EwcCL's and ReplayCL's helper methods via Python's
 unbound-method assignment (not multiple inheritance, not a mixin abstraction —

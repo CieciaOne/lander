@@ -37,8 +37,10 @@ class MasCL(EwcCL):
 
     def __init__(
         self,
-        lam: float = 1000.0,    # MAS importance values tend to be smaller
-                                  # than Fisher; needs ~5x EWC lam to match
+        lam: float = 5000.0,    # MAS importance values tend to be smaller
+                                  # than Fisher; ~5x EWC lam to match its
+                                  # effective penalty scale. (Was 1000 —
+                                  # inconsistent with this very comment.)
         fisher_sample_size: int = 512,
         ppo_kwargs: dict[str, Any] | None = None,
         **kwargs,

@@ -89,7 +89,9 @@ class Task:
     min_success_to_advance: float | None = None
     max_budget_multiplier: float = 2.0
     gate_check_interval: int = 50_000
-    gate_eval_episodes: int = 8
+    # 16 episodes → binomial std ≈ 0.125 at p=0.5; at the old default of 8
+    # the gate advanced phases on ±18pp noise.
+    gate_eval_episodes: int = 16
     # Interim eval cadence. When > 0, the Runner runs `interim_eval_episodes`
     # rollouts on the current phase task every `interim_eval_every` env
     # steps and stashes the per-checkpoint success rate in results.json
@@ -221,7 +223,15 @@ class Runner:
         return self.results_dir / "tb"
 
     def run(self) -> MissionResult:
-        cl: CLMethod = make_cl(self.mission.cl_method, **self.mission.cl_kwargs)
+        # Thread the mission seed into PPO itself (network init, action
+        # sampling). Without this, PPO draws from the global torch RNG and
+        # a re-run of the same (scenario, method, seed) triple produces a
+        # different policy trajectory — not reproducible.
+        cl_kwargs = dict(self.mission.cl_kwargs)
+        ppo_kw = dict(cl_kwargs.get("ppo_kwargs") or {})
+        ppo_kw.setdefault("seed", self.mission.seed)
+        cl_kwargs["ppo_kwargs"] = ppo_kw
+        cl: CLMethod = make_cl(self.mission.cl_method, **cl_kwargs)
         task_ids = [t.task_id for t in self.mission.tasks]
         evaluations: list[PhaseResult] = []
 
@@ -395,6 +405,18 @@ class Runner:
                 f"episodes={n_train_episodes} "
                 f"(mean len={mean_ep_len:.0f} steps)"
             )
+            # CL-method diagnostics: surface the penalty / rehearsal scale so
+            # a mis-calibrated lam (penalty dominating or a no-op) is visible
+            # in the log instead of silently corrupting the comparison.
+            cl_diag: dict[str, float] = {}
+            for attr in ("last_penalty_value", "last_penalty_steps_run",
+                         "last_rehearsal_steps_run", "last_distill_kl"):
+                val = getattr(cl, attr, None)
+                if val is not None and val != 0:
+                    cl_diag[attr] = float(val)
+            if cl_diag:
+                self._log("  cl diagnostics: "
+                          + " ".join(f"{k}={v:.4g}" for k, v in cl_diag.items()))
 
             try:
                 train_env.close()
@@ -485,6 +507,9 @@ class Runner:
                 # eval / adaptive gating. Each entry has steps_trained,
                 # success_rate, mean_return, n_episodes.
                 "interim_eval": interim_history,
+                # CL-method scale diagnostics from the last train_on call of
+                # this phase (penalty value, hook/rehearsal step counts).
+                "cl_diagnostics": cl_diag,
             }
             evaluations.append(PhaseResult(
                 phase=phase, after_training=task.task_id,

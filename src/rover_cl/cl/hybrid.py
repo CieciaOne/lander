@@ -6,10 +6,10 @@ The strongest practical CL approach for our setting. Combines:
     transitions, replayed via behaviour-cloning BEFORE each new task's PPO
     learn pass. Anchors the policy to past-task behaviours at the boundary.
 
-  * **EWC** (from `EwcCL`): diagonal Fisher snapshot per task + dedicated
-    penalty-only optimization steps AFTER PPO learning. Pulls weights
-    back toward `theta_star` so the new PPO update doesn't drift too far
-    on parameters important to past tasks.
+  * **EWC** (from `EwcCL`): diagonal Fisher snapshot per task + penalty
+    gradient integrated into every PPO gradient step via parameter hooks
+    (see ewc.py). Constrains drift on parameters important to past tasks
+    THROUGHOUT the new task's training, not just at the boundary.
 
 The implementation reuses EwcCL's and ReplayCL's helper methods via
 Python's unbound-method assignment — no new abstraction layer, just
@@ -42,9 +42,6 @@ class HybridEwcReplayCL(BaseCLMethod):
         # does some of the work, EWC doesn't have to push as hard).
         lam: float = 400.0,
         fisher_sample_size: int = 512,
-        penalty_steps: int = 50,
-        penalty_lr: float = 1e-3,
-        penalty_grad_clip: float = 1.0,
         # Replay knobs.
         buffer_size_per_task: int = 1000,
         rehearsal_batch_size: int = 64,
@@ -56,12 +53,10 @@ class HybridEwcReplayCL(BaseCLMethod):
         # EWC state.
         self.lam = float(lam)
         self.fisher_sample_size = int(fisher_sample_size)
-        self.penalty_steps = int(penalty_steps)
-        self.penalty_lr = float(penalty_lr)
-        self.penalty_grad_clip = float(penalty_grad_clip)
         self.fisher: dict[str, dict[str, th.Tensor]] = {}
         self.theta_star: dict[str, dict[str, th.Tensor]] = {}
         self.last_penalty_steps_run: int = 0
+        self.last_penalty_value: float = 0.0
         # Replay state.
         self.buffer_size_per_task = int(buffer_size_per_task)
         self.rehearsal_batch_size = int(rehearsal_batch_size)
@@ -77,7 +72,8 @@ class HybridEwcReplayCL(BaseCLMethod):
     # chains and post_train semantics). Not a new abstraction — just
     # Python's normal way to share method implementations.
     _snapshot_params = EwcCL._snapshot_params
-    _apply_ewc_penalty = EwcCL._apply_ewc_penalty
+    _install_penalty_hooks = EwcCL._install_penalty_hooks
+    _compute_penalty_value = EwcCL._compute_penalty_value
     _collect_fisher = EwcCL._collect_fisher
     _rehearse = ReplayCL._rehearse
     _sample_mixed_batch = ReplayCL._sample_mixed_batch
@@ -106,26 +102,34 @@ class HybridEwcReplayCL(BaseCLMethod):
         else:
             self.last_rehearsal_steps_run = 0
 
-        # 2) PPO learning on the current task.
+        # 2) PPO learning on the current task, with the EWC penalty gradient
+        #    hooked into every backward pass (same mechanism as EwcCL).
+        ewc_past_ids = [tid for tid in self.fisher if tid != task_id]
+        handles = self._install_penalty_hooks(ewc_past_ids) if ewc_past_ids else []
+
         _ent_restore = None
         if ent_coef is not None:
             _ent_restore = float(self.model.ent_coef)
             self.model.ent_coef = float(ent_coef)
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            reset_num_timesteps=False,
-            tb_log_name=f"hybrid_{task_id}",
-            callback=callback,
-        )
+        try:
+            self.model.learn(
+                total_timesteps=total_timesteps,
+                reset_num_timesteps=False,
+                tb_log_name=f"hybrid_{task_id}",
+                callback=callback,
+            )
+        finally:
+            for h in handles:
+                h.remove()
         if _ent_restore is not None:
             self.model.ent_coef = _ent_restore
 
-        # 3) AFTER PPO learn: EWC penalty pull-back on past tasks.
-        ewc_past_ids = [tid for tid in self.fisher if tid != task_id]
-        if ewc_past_ids:
-            self._apply_ewc_penalty(ewc_past_ids)
-        else:
-            self.last_penalty_steps_run = 0
+        self.last_penalty_steps_run = (
+            self._hook_backward_count if ewc_past_ids else 0
+        )
+        self.last_penalty_value = (
+            self._compute_penalty_value(ewc_past_ids) if ewc_past_ids else 0.0
+        )
 
         if task_id not in self.seen_task_ids:
             self.seen_task_ids.append(task_id)
@@ -157,7 +161,7 @@ class HybridEwcReplayCL(BaseCLMethod):
             for n, t in self.theta_star.get(tid, {}).items():
                 payload_ewc[f"theta::{tid}::{n}"] = t.detach().cpu().numpy()
         payload_ewc["__meta__"] = np.asarray(
-            [self.lam, self.fisher_sample_size, self.penalty_steps], dtype=np.float64
+            [self.lam, self.fisher_sample_size], dtype=np.float64
         )
         np.savez(ewc_path, **payload_ewc)
 
@@ -202,7 +206,6 @@ class HybridEwcReplayCL(BaseCLMethod):
                 meta = data["__meta__"]
                 inst.lam = float(meta[0])
                 inst.fisher_sample_size = int(meta[1])
-                inst.penalty_steps = int(meta[2])
             device = inst.model.policy.device
             for key in data.files:
                 if key.startswith("fisher::"):

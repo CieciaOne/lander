@@ -25,6 +25,7 @@ Termination: success (within goal_radius for GOAL_HOLD_STEPS), timeout, tipped.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +35,150 @@ import numpy as np
 from gymnasium import spaces
 
 from .terrains import TerrainSpec, compile_scene, compose_scene, get_terrain
+
+
+class NavField:
+    """Obstacle-aware distance-to-target field over a grid (a navigation
+    function). Cell value = shortest collision-free path length from that cell
+    to the target, computed by Dijkstra on an 8-connected grid where cells
+    covered by an obstacle (inflated by the rover footprint) are blocked.
+
+    Used for `progress_reward_mode="geodesic"`: rewarding the reduction of this
+    geodesic distance gives the policy a gradient that routes AROUND blocking
+    obstacles, instead of the straight-line Euclidean distance whose gradient
+    points through them. On obstacle-free terrain the field equals Euclidean
+    distance, so open-terrain behaviour is unchanged.
+    """
+
+    _SQRT2 = float(np.sqrt(2.0))
+
+    def __init__(self, half_extent: float, res: float,
+                 obstacles_xywh: list[tuple[float, float, float, float]],
+                 target_xy: tuple[float, float], inflate: float):
+        self.half = float(half_extent)
+        self.res = float(res)
+        self.n = max(4, int(np.ceil(2 * self.half / self.res)))
+        blocked = np.zeros((self.n, self.n), dtype=bool)
+        for (cx, cy, sx, sy) in obstacles_xywh:
+            x0 = cx - sx - inflate; x1 = cx + sx + inflate
+            y0 = cy - sy - inflate; y1 = cy + sy + inflate
+            i0, i1 = self._idx(x0), self._idx(x1)
+            j0, j1 = self._idx(y0), self._idx(y1)
+            blocked[i0:i1 + 1, j0:j1 + 1] = True
+        # Dijkstra from the target cell. Force the target cell free so there is
+        # always a source even if the goal sits just inside an inflated AABB.
+        ti, tj = self._idx(target_xy[0]), self._idx(target_xy[1])
+        blocked[ti, tj] = False
+        INF = np.inf
+        dist = np.full((self.n, self.n), INF, dtype=np.float64)
+        dist[ti, tj] = 0.0
+        heap = [(0.0, ti, tj)]
+        n = self.n
+        while heap:
+            d, i, j = heapq.heappop(heap)
+            if d > dist[i, j]:
+                continue
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    if di == 0 and dj == 0:
+                        continue
+                    ni, nj = i + di, j + dj
+                    if ni < 0 or nj < 0 or ni >= n or nj >= n:
+                        continue
+                    if blocked[ni, nj]:
+                        continue
+                    step = self.res * (self._SQRT2 if (di and dj) else 1.0)
+                    nd = d + step
+                    if nd < dist[ni, nj]:
+                        dist[ni, nj] = nd
+                        heapq.heappush(heap, (nd, ni, nj))
+        self.dist = dist
+
+    def _idx(self, w: float) -> int:
+        return int(np.clip((w + self.half) / self.res, 0, self.n - 1))
+
+    def distance(self, x: float, y: float) -> float:
+        """Geodesic distance from world (x, y) to the target; NaN if the cell
+        is unreachable/blocked (caller falls back to the previous value)."""
+        d = float(self.dist[self._idx(x), self._idx(y)])
+        return d if np.isfinite(d) else float("nan")
+
+    def heading(self, x: float, y: float) -> tuple[float, float] | None:
+        """World-frame unit vector along the shortest collision-free path from
+        (x, y) toward the target — the smooth direction of steepest geodesic
+        descent, i.e. -normalize(∇dist) via central differences of the distance
+        field. Continuous (not quantized to 8 compass directions), so it makes
+        a clean control target. None if the local field is unusable (all
+        neighbours blocked / at target). This is the 'which way to go, routing
+        around obstacles' signal; the straight-line bearing points through
+        blocking obstacles."""
+        i, j = self._idx(x), self._idx(y)
+        n = self.n
+        d0 = self.dist[i, j]
+        if not np.isfinite(d0):
+            return None
+
+        def _grad(a_lo, a_hi, cur):
+            # central difference where both sides finite; else one-sided;
+            # returns None if neither neighbour is usable.
+            lo_ok = np.isfinite(a_lo)
+            hi_ok = np.isfinite(a_hi)
+            if lo_ok and hi_ok:
+                return (a_hi - a_lo) * 0.5
+            if hi_ok:
+                return a_hi - cur
+            if lo_ok:
+                return cur - a_lo
+            return None
+
+        gx = _grad(self.dist[i - 1, j] if i > 0 else np.inf,
+                   self.dist[i + 1, j] if i < n - 1 else np.inf, d0)
+        gy = _grad(self.dist[i, j - 1] if j > 0 else np.inf,
+                   self.dist[i, j + 1] if j < n - 1 else np.inf, d0)
+        if gx is None:
+            gx = 0.0
+        if gy is None:
+            gy = 0.0
+        # descent direction = -gradient
+        vx, vy = -float(gx), -float(gy)
+        norm = (vx * vx + vy * vy) ** 0.5
+        if norm < 1e-6:
+            return None
+        return (vx / norm, vy / norm)
+
+    def lookahead_heading(self, x: float, y: float,
+                          lookahead_cells: int = 8) -> tuple[float, float] | None:
+        """Pure-pursuit heading: walk down the geodesic (greedy min-distance
+        8-neighbour) for up to `lookahead_cells` steps and return the world
+        unit vector from (x, y) to that lookahead cell. Anticipates the route
+        so the rover turns EARLY around obstacles instead of chasing the local
+        gradient (which only bends hard once it's already at the obstacle and
+        so gets clipped). Falls back to the local gradient if the walk stalls
+        immediately."""
+        i0, j0 = self._idx(x), self._idx(y)
+        n = self.n
+        if not np.isfinite(self.dist[i0, j0]):
+            return None
+        i, j = i0, j0
+        for _ in range(lookahead_cells):
+            best = self.dist[i, j]
+            bi, bj = i, j
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    if di == 0 and dj == 0:
+                        continue
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < n and 0 <= nj < n and self.dist[ni, nj] < best:
+                        best = self.dist[ni, nj]
+                        bi, bj = ni, nj
+            if bi == i and bj == j:
+                break
+            i, j = bi, bj
+        if i == i0 and j == j0:
+            return self.heading(x, y)
+        vx, vy = float(i - i0), float(j - j0)
+        norm = (vx * vx + vy * vy) ** 0.5
+        return (vx / norm, vy / norm)
 
 
 # Obstacle observation — for each of the K nearest box obstacles, the policy
@@ -52,6 +197,60 @@ K_OBSTACLES = 8
 OBSTACLE_SENSE_RANGE = 8.0
 OBSTACLE_FEATURES_PER_SLOT = 4  # (fwd_min, fwd_max, right_min, right_max)
 
+# Body-frame tilt features (2): the world-up vector projected into the rover
+# body-XY plane. Both ~0 when upright; tilt_fwd > 0 = nose up, tilt_right > 0
+# = leaning right. Range [-1, 1]. Critical on hfield terrains where the
+# policy otherwise can only react to a tilt *after* the chassis has already
+# rolled — these features make slopes visible before the body integrates
+# them into linvel/angvel.
+N_TILT_FEATURES = 2
+
+# Previous action (2): action_{t-1} clipped to [-1, 1]. Lets the policy
+# satisfy the action-jerk penalty by issuing smooth continuations instead
+# of having to reconstruct prior command from velocity.
+N_PREV_ACTION_FEATURES = 2
+
+# Lidar forward-fan config (used only when RoverNavEnv(use_lidar=True)).
+# A ray scan is the standard egocentric obstacle representation; the abstract
+# 8×AABB slots alone proved too hard for the policy to route around blocking
+# obstacles. Rays are masked to LIDAR_OBSTACLE_GROUP (obstacle geoms only).
+N_LIDAR_RAYS = 15                   # 15 rays over ±90° ≈ 12.8° spacing (was 9)
+LIDAR_HALF_ARC = float(np.pi / 2)   # ±90° forward fan
+LIDAR_OBSTACLE_GROUP = 4            # private geom group for raycast masking
+LIDAR_HEIGHT_OFFSET = 0.35          # ray height below the rover base (≈ obstacle mid-height)
+
+
+def _build_obs_scale() -> np.ndarray:
+    """Fixed per-component observation scaling → everything lands in ~[-3, 3].
+
+    FIXED constants rather than running statistics (VecNormalize) — in a
+    continual-learning experiment the obs distribution shifts between tasks,
+    so running stats would themselves drift and re-normalize OLD tasks' obs
+    differently over time. That drift is indistinguishable from forgetting
+    in the retention metrics. Fixed scaling has no such confounder, needs no
+    train/eval/checkpoint synchronization, and is trivially reproducible.
+
+    Scales (divisors): positions/distances 10 m, heading π rad, linear
+    velocities 1 m/s, yaw rate 2 rad/s, obstacle AABB coords 10 m, tilt and
+    prev_action already in [-1, 1].
+    """
+    scale = np.ones(
+        6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+        + N_TILT_FEATURES + N_PREV_ACTION_FEATURES,
+        dtype=np.float32,
+    )
+    scale[0:2] = 10.0          # rel_fwd, rel_right (m)
+    scale[2] = np.pi           # heading_to_target (rad)
+    scale[3:5] = 1.0           # body-frame linvel (m/s)
+    scale[5] = 2.0             # angvel_z (rad/s)
+    scale[6:8] = 10.0          # lookahead rel_fwd_next, rel_right_next (m)
+    scale[8:8 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT] = 10.0  # AABBs (m)
+    # tilt (2) and prev_action (2) stay at 1.0
+    return scale
+
+
+OBS_SCALE: np.ndarray = _build_obs_scale()
+
 # Rover footprint radius (chassis is 0.55 m half-width, but rocker arms +
 # wheels extend further). Used to inflate obstacle AABBs in the policy's
 # observation: Minkowski sum of obstacle with rover-radius disk, so the
@@ -66,7 +265,34 @@ ROVER_FOOTPRINT_RADIUS = 0.9
 # collision detection only fires on the actual chassis / wheels.
 ARM_STOW_CTRL = (0.0, 1.5, 2.5, 0.0)  # (yaw, shoulder, elbow, wrist)
 MAX_WHEEL_VEL = 3.0     # rad/s — wheel angular velocity at throttle=1
-MAX_STEER_RAD = 1.0     # rad — corner steer angle at |steer|=1 (matches MJCF ctrlrange)
+WHEEL_RADIUS = 0.22     # m — drive wheel radius (matches rover.xml sphere collider)
+# (v, ω) control-mode limits. V_MAX ≈ MAX_WHEEL_VEL·r (no-slip top speed);
+# OMEGA_MAX chosen so a point-turn (corner wheels at radius ≈1.07 m) stays
+# within the drive actuator limit: 0.66/1.07 ≈ 0.62 rad/s, rounded to 0.7.
+V_MAX = MAX_WHEEL_VEL * WHEEL_RADIUS   # ≈ 0.66 m/s (traction-limited straight speed)
+# Maneuverability upgrade (vw mode only): give the (v, ω) controller a higher
+# wheel-speed headroom than MAX_WHEEL_VEL so that turning-WHILE-moving no longer
+# saturates and gets scaled down (the arc-stall that made every avoidance
+# controller freeze ~1.5 m short of an obstacle). Straight speed stays capped by
+# traction (~0.66 m/s); this only frees up the extra wheel speed a turn needs.
+# The drive actuator ctrlrange is widened to match in RoverNavEnv.__init__ when
+# control_mode="vw". Does NOT affect the Ackermann path / scenario_14.
+VW_MAX_WHEEL_VEL = 6.0                   # rad/s (vw normalization headroom)
+OMEGA_MAX = 0.8                          # rad/s (realistic moderate; Curiosity-style point-turn)
+# Full mechanical steer range of the corner knuckles (rover.xml jnt_range
+# ±57°). The (v, ω) controller commands geometrically-correct per-wheel
+# angles up to this; the reduced MAX_STEER_RAD only bounds the legacy
+# single-steer Ackermann action, not the vw controller.
+MAX_STEER_JOINT = 1.0   # rad
+# Corner-steer angle at |steer|=1. Reduced 1.0 → 0.40 rad (~23°) after a
+# turning-authority audit: at the old 1.0 rad (57°) the un-steered middle
+# wheels bind and the rover STALLS during a turn (~-4°/s yaw at 0.09 m/s).
+# Peak turning happens near 0.3-0.45 rad (~-10°/s at 0.45 m/s), so mapping
+# the full action extreme to 0.40 rad makes the ENTIRE steer axis useful
+# and removes the over-steer stall trap that made navigation phases
+# unlearnable (the policy kept commanding max steer and freezing). The
+# steer joint range is ±1.0 rad, so 0.40 is well within actuator limits.
+MAX_STEER_RAD = 0.40    # rad — corner steer angle at |steer|=1
 TIP_OVER_COS = 0.5      # cos(angle from upright) below which we count as tipped
 GOAL_HOLD_STEPS = 5
 
@@ -107,6 +333,31 @@ class RoverNavEnv(gym.Env):
         max_steps: int = 500,
         control_decimation: int = 5,
         progress_reward_scale: float = 5.0,
+        # Progress-shaping mode:
+        #   "delta" — reward 5.0*(prev_dist - dist) every step (symmetric).
+        #             Dense, but PENALIZES any step that moves away from the
+        #             target — including the lateral detour needed to get
+        #             around a blocking obstacle. That local disincentive is
+        #             why PPO refuses to route around obstacles and rams them.
+        #   "best"  — reward 5.0*max(0, best_dist_so_far - dist): only NEW
+        #             closest-approach progress is paid. Moving away/sideways
+        #             during a detour costs nothing (no negative reward), so
+        #             maneuvering around an obstacle is free; the reward
+        #             arrives once the rover clears it and gets closer than
+        #             ever. Cannot be reward-farmed (returning to an already-
+        #             achieved distance pays 0). Removes the ram incentive but
+        #             gives NO guidance around an obstacle (no gradient when
+        #             blocked), so the rover wanders when a detour is required.
+        #   "geodesic" — same "best" monotone-progress logic, but distance is
+        #             the OBSTACLE-AWARE geodesic distance from a NavField
+        #             (shortest collision-free path length to the target),
+        #             recomputed per episode and per waypoint. Its gradient
+        #             routes AROUND blocking obstacles, so the reward actively
+        #             guides the detour instead of merely not punishing it. On
+        #             obstacle-free terrain it equals Euclidean distance, so
+        #             open-terrain behaviour matches "best"/"delta".
+        progress_reward_mode: str = "geodesic",
+        nav_field_res: float = 0.3,   # NavField grid cell size in metres
         goal_bonus: float = 50.0,
         # Collision penalties softened from (3.0/step + 10 hit) → (1.5/step
         # + 5 hit). Previous values made "freeze near start" a strictly
@@ -116,7 +367,14 @@ class RoverNavEnv(gym.Env):
         # collision deterrents combined with a much larger stuck-no-
         # progress penalty (below) reverse the gradient: any progress at
         # all dominates freezing.
-        collision_penalty: float = 1.5,      # per-step while in contact
+        # collision_penalty disabled by default (was 1.5/step). The one-shot
+        # hit_penalty is enough deterrent on its own, and the per-step
+        # variant historically created a "freeze near start" local optimum
+        # (any movement risked a graze worth -1.5/step, while staying still
+        # paid -0.01/step until stuck_no_progress fired). Keep the kwarg in
+        # place so existing callers and tests still work; set > 0 to
+        # restore the old behaviour.
+        collision_penalty: float = 0.0,      # per-step while in contact
         hit_penalty: float = 5.0,            # one-shot on collision transition
         step_cost: float = 0.01,
         tipped_penalty: float = 20.0,
@@ -132,13 +390,24 @@ class RoverNavEnv(gym.Env):
         # crosses waypoint → target snaps to next position → confusion) was
         # too small to overcome the disorientation that follows. At 20 the
         # checkpoint moment is unambiguously a big positive event.
-        waypoint_bonus: float = 20.0,
+        # waypoint_bonus halved 20 → 10. The previous value was ~80 steps
+        # of typical progress-shaping reward, creating a large discontinuity
+        # in the value target that PPO had to model around every waypoint
+        # transition. Halving keeps the "checkpoint reached" signal clearly
+        # positive but lets per-step progress carry more of the credit
+        # assignment.
+        waypoint_bonus: float = 10.0,
         # Speed bonus on every checkpoint (waypoint + final goal): adds an extra
         # `speed_bonus_scale * base_bonus * (1 - steps_used / max_steps)`. At
         # step 0 the rover effectively gets DOUBLE the bonus; the bonus decays
         # linearly to 0 if it takes the full episode. This rewards reaching
         # checkpoints quickly without changing the per-step economics.
-        speed_bonus_scale: float = 1.0,
+        # speed_bonus_scale halved 1.0 → 0.5. With the old value reaching the
+        # goal at step 0 paid 2× the base goal_bonus, which created strong
+        # pressure to rush at the cost of the jerk/collision/wheels-off
+        # signals. Step cost already implicitly rewards speed; the time-decay
+        # bonus is now a finishing nudge rather than a 2× multiplier.
+        speed_bonus_scale: float = 0.5,
         # Per-reset starting-pose jitter. With deterministic policy + fixed
         # terrain, every eval episode produces the same rollout — adding small
         # jitter both diversifies eval trajectories AND makes the policy more
@@ -199,6 +468,68 @@ class RoverNavEnv(gym.Env):
         # but not endless.
         waypoint_time_bonus_per_metre: float = 40.0,
         waypoint_time_bonus_base: int = 200,
+        # Lidar observation (opt-in, default OFF). When True, the 5 MJCF
+        # forward-fan rangefinder sensors (±60°, ±30°, 0° at 0.30 m height)
+        # are appended to the observation as normalized clearances in [0, 1]
+        # (1 = clear/far, small = obstacle close). This is the standard
+        # egocentric range representation that makes obstacle avoidance
+        # readily learnable — the abstract 8×AABB obstacle slots alone proved
+        # too hard for the policy to route around blocking obstacles. Off by
+        # default so open/terrain tasks and the scenario_14 CL benchmark keep
+        # their 44-D obs; turn on for obstacle-navigation tasks.
+        use_lidar: bool = False,
+        lidar_max_range: float = 8.0,
+        # Geodesic-heading observation (opt-in, default OFF). Appends 2 dims:
+        # the body-frame unit vector along the shortest COLLISION-FREE path to
+        # the current target (the NavField gradient). The default target obs
+        # (rel_fwd/rel_right) points in a straight line — through blocking
+        # obstacles — so the policy is told "goal ahead" while the geodesic
+        # reward pays it to go around: a contradictory signal it can't resolve.
+        # This exposes the detour direction directly, reducing obstacle
+        # avoidance to "drive toward this bearing" (a skill locomotion already
+        # has). Requires progress_reward_mode="geodesic" (the field is built
+        # only then); falls back to the straight-line bearing otherwise.
+        geo_heading_obs: bool = False,
+        # Pure-pursuit lookahead for the bent bearing: 0 = local gradient
+        # (bends late, gets clipped); >0 = point the bearing this many grid
+        # cells ahead along the geodesic so the rover turns EARLY around
+        # obstacles. At res 0.3 m, 8 cells ≈ 2.4 m lookahead.
+        geo_lookahead_cells: int = 0,
+        # NavField obstacle inflation (metres) for BOTH the geodesic reward and
+        # the bent-bearing heading. Larger than the true footprint routes the
+        # planned path WIDER around obstacles, giving the Ackermann rover
+        # (turn radius ~2.75 m) margin so its imperfect arc-following doesn't
+        # clip the obstacle — the dominant failure mode. Defaults to the
+        # footprint radius (tight routing).
+        nav_field_inflate: float | None = None,
+        # Skid-steer yaw assist (opt-in, default 0 = pure Ackermann). Adds a
+        # left/right wheel-speed differential ∝ steer so the rover turns
+        # tighter than its ~2.75 m Ackermann radius — needed to follow the
+        # routed geodesic bearing around obstacles without clipping them
+        # (the dominant obstacle-episode failure).
+        skid_gain: float = 0.0,
+        # Control interface:
+        #   "ackermann" (default, legacy) — action = (throttle, steer), a
+        #     car-like model with a single mirrored steer across the 4 corner
+        #     knuckles. Limited to a ~2.75 m turn radius; cannot point-turn.
+        #   "vw" — action = (forward_velocity, yaw_rate); a proper rover
+        #     mobility controller sets EACH corner knuckle's steer angle and
+        #     EACH wheel's speed from the instantaneous-centre-of-rotation
+        #     geometry (independent explicit steering, as on Curiosity). Gives
+        #     the policy direct yaw-rate control incl. point-turns (v≈0, ω≠0),
+        #     so it can follow the routed geodesic bearing around obstacles
+        #     instead of arcing wide and clipping them.
+        control_mode: str = "ackermann",
+        # Clearance-speed penalty (opt-in, default 0). Penalises FORWARD SPEED
+        # in proportion to obstacle proximity: `scale · |v_fwd| · max(0, 1 −
+        # d/ safe)`. Unlike the proximity penalty (which punishes BEING near an
+        # obstacle → the policy freezes away from it), this punishes only
+        # moving FAST near one, so the rover learns to SLOW DOWN and clear
+        # obstacles carefully instead of clipping them at speed — the dominant
+        # obstacle-episode failure — while slow motion nearby stays free (no
+        # freeze). Uses `_min_obstacle_dist` (m).
+        clearance_speed_penalty_scale: float = 0.0,
+        clearance_safe_dist: float = 2.0,
         seed: int = 0,
         render_mode: str | None = None,
     ):
@@ -208,6 +539,12 @@ class RoverNavEnv(gym.Env):
         self.max_steps = max_steps
         self.control_decimation = control_decimation
         self.progress_reward_scale = progress_reward_scale
+        self.progress_reward_mode = str(progress_reward_mode)
+        self.nav_field_res = float(nav_field_res)
+        self.nav_field_inflate = (float(nav_field_inflate)
+                                  if nav_field_inflate is not None
+                                  else ROVER_FOOTPRINT_RADIUS)
+        self._nav_field: NavField | None = None
         self.goal_bonus = goal_bonus
         self.collision_penalty = collision_penalty
         self.hit_penalty = hit_penalty
@@ -267,15 +604,75 @@ class RoverNavEnv(gym.Env):
                       "steer_left_front",  "steer_left_rear"]
         ]
 
+        # Lidar observation, opt-in. Implemented as our own `mj_ray` fan
+        # rather than the MJCF `rangefinder` sensors, which are unusable for
+        # obstacle sensing: their sites sit at z≈1.05 m (above the ~1.0 m
+        # obstacle tops, so rays skim over) and self-hit the mast. We instead
+        # cast N rays in a forward fan at obstacle mid-height, masked to a
+        # dedicated geom group that contains ONLY the obstacle geoms — so a
+        # ray can never hit the rover, ground, or heightmap, and returns the
+        # clean distance to the nearest obstacle along each bearing. This is
+        # the standard egocentric range scan that makes obstacle avoidance
+        # learnable.
+        # geo_heading_obs BENDS the target-bearing obs (obs[0:2]) along the
+        # NavField geodesic instead of adding dims — no obs-dim change, so it
+        # composes with the CL benchmark, and in open space it is identical to
+        # the straight-line bearing (heading == straight → locomotion obs
+        # unchanged). Only bends when an obstacle actually routes the path.
+        self.skid_gain = float(skid_gain)
+        self.control_mode = str(control_mode)
+        if self.control_mode == "vw":
+            # Widen the drive actuators' ctrlrange so the vw controller's
+            # higher wheel-speed commands (VW_MAX_WHEEL_VEL) actually execute
+            # instead of being clamped to the ±3.0 Ackermann default.
+            for _n in ["drive_right_front", "drive_right_middle", "drive_right_rear",
+                       "drive_left_front", "drive_left_middle", "drive_left_rear"]:
+                _aid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_ACTUATOR, _n)
+                if _aid >= 0:
+                    self._model.actuator_ctrlrange[_aid] = [-VW_MAX_WHEEL_VEL, VW_MAX_WHEEL_VEL]
+        self.clearance_speed_penalty_scale = float(clearance_speed_penalty_scale)
+        self.clearance_safe_dist = float(clearance_safe_dist)
+        self.geo_heading_obs = bool(geo_heading_obs)
+        self.geo_lookahead_cells = int(geo_lookahead_cells)
+        self._n_geo_heading = 0
+        self.use_lidar = bool(use_lidar)
+        self.lidar_max_range = float(lidar_max_range)
+        self._n_lidar = N_LIDAR_RAYS if self.use_lidar else 0
+        if self.use_lidar:
+            # Reassign obstacle geoms to a private raycast group (geom_group
+            # only affects visualization / ray filtering, NOT collision, which
+            # is governed by contype/conaffinity). Rays mask to this group.
+            self._lidar_group_mask = np.zeros(6, dtype=np.uint8)
+            self._lidar_group_mask[LIDAR_OBSTACLE_GROUP] = 1
+            for gid in self._obstacle_geom_ids:
+                if gid >= 0:
+                    self._model.geom_group[gid] = LIDAR_OBSTACLE_GROUP
+            # Fan angles (body-frame bearings), evenly spaced over the arc.
+            self._lidar_angles = np.linspace(
+                -LIDAR_HALF_ARC, LIDAR_HALF_ARC, N_LIDAR_RAYS, dtype=np.float64
+            )
+
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        # obs layout:
-        #   [0..6)  pose+velocity vs current target (6 dims)
-        #   [6..8)  NEXT target rel_fwd, rel_right (lookahead — sentinel (0, 0)
-        #           if there's no next target, i.e. current target IS the goal).
-        #           Lets the policy plan its trajectory across waypoint
-        #           boundaries instead of swinging wide at every transition.
-        #   [8..)   K obstacles × (fwd_min, fwd_max, right_min, right_max)
-        obs_dim = 6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+        # obs layout (44 dims):
+        #   [0..6)   pose+velocity vs current target (6 dims)
+        #   [6..8)   NEXT target rel_fwd, rel_right (lookahead — sentinel
+        #            (0, 0) if there's no next target, i.e. current target
+        #            IS the goal). Lets the policy plan its trajectory
+        #            across waypoint boundaries instead of swinging wide at
+        #            every transition.
+        #   [8..40)  K obstacles × (fwd_min, fwd_max, right_min, right_max)
+        #   [40..42) tilt_fwd, tilt_right (body-frame world-up projection):
+        #            nose pitch and side roll. Both ~0 upright, range [-1, 1].
+        #   [42..44) prev_action (throttle_{t-1}, steer_{t-1}) — lets the
+        #            policy smoothly continue commands instead of fighting
+        #            the action-jerk penalty.
+        #   [44..44+n_lidar) OPTIONAL forward-fan lidar clearances in [0, 1]
+        #            (1 = clear, small = obstacle close), only when use_lidar.
+        obs_dim = (
+            6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+            + N_TILT_FEATURES + N_PREV_ACTION_FEATURES
+            + self._n_geo_heading + self._n_lidar
+        )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -326,9 +723,26 @@ class RoverNavEnv(gym.Env):
         c, s = np.cos(yaw), np.sin(yaw)
         rover_x, rover_y = float(pos_xy[0]), float(pos_xy[1])
         items: list[tuple[float, float, float, float, float]] = []
-        for ob in self.terrain.obstacles:
-            cx, cy = ob.pos[0], ob.pos[1]
-            sx, sy = ob.size[0], ob.size[1]
+        # Read obstacle geometry from the LIVE MuJoCo model (data.geom_xpos +
+        # model.geom_size), NOT from self.terrain.obstacles. On randomized
+        # terrains `_apply_terrain_roll` re-rolls obstacle positions/sizes into
+        # the model (geom_pos / mocap_pos) but does NOT write them back to the
+        # TerrainSpec — so reading the spec showed the policy phantom obstacles
+        # at their compile-time positions (origin / HIDE_Z) while the real ones
+        # were invisible. That silently blinded the policy to every obstacle on
+        # every RC_/RT_ terrain. geom_xpos is the ground truth for both static
+        # and mocap obstacles (mj_forward/mj_step keep it current) and matches
+        # what collision detection and the trajectory plotter already use.
+        for gid in self._obstacle_geom_ids:
+            if gid < 0:
+                continue
+            wpos = self._data.geom_xpos[gid]
+            cz = float(wpos[2])
+            if cz < -10.0:   # hidden slot parked below the floor
+                continue
+            cx, cy = float(wpos[0]), float(wpos[1])
+            gsize = self._model.geom_size[gid]
+            sx, sy = float(gsize[0]), float(gsize[1])
             # Distance from rover to nearest point on the world-AABB.
             nx = float(np.clip(rover_x, cx - sx, cx + sx))
             ny = float(np.clip(rover_y, cy - sy, cy + sy))
@@ -371,6 +785,65 @@ class RoverNavEnv(gym.Env):
     def _current_target(self) -> np.ndarray:
         return np.array(self._targets[self._wp_idx], dtype=np.float32)
 
+    def _cast_lidar(self, pos_xy: np.ndarray, yaw: float) -> np.ndarray:
+        """Cast the forward-fan ray scan; return per-ray clearances in [0, 1]
+        (1 = clear to max range, small = obstacle close). Rays are masked to
+        the obstacle-only geom group, so they never hit the rover/ground."""
+        base_z = float(self._sensor(self._base_pos_id, 3)[2])
+        origin = np.array([float(pos_xy[0]), float(pos_xy[1]),
+                           base_z - LIDAR_HEIGHT_OFFSET], dtype=np.float64)
+        # body-forward world vector = (-sin yaw, cos yaw); body-right = (cos, sin)
+        s, c = np.sin(yaw), np.cos(yaw)
+        out = np.empty(self._n_lidar, dtype=np.float32)
+        gid = np.array([-1], dtype=np.int32)
+        for k, a in enumerate(self._lidar_angles):
+            # bearing a measured from forward, positive = toward rover-right
+            ca, sa = np.cos(a), np.sin(a)
+            # forward rotated by a in the body plane, expressed in world:
+            fx, fy = -s, c            # forward
+            rx, ry = c, s             # right
+            dvec = np.array([fx * ca + rx * sa, fy * ca + ry * sa, 0.0],
+                            dtype=np.float64)
+            dist = mujoco.mj_ray(self._model, self._data, origin, dvec,
+                                 self._lidar_group_mask, 1, -1, gid)
+            if dist < 0.0:
+                out[k] = 1.0
+            else:
+                out[k] = min(float(dist), self.lidar_max_range) / self.lidar_max_range
+        return out
+
+    def _rebuild_nav_field(self, target_xy) -> None:
+        """(Re)build the obstacle-aware NavField for the given target, reading
+        live obstacle geometry from the model. Called on reset and on each
+        waypoint advance (obstacles are static within an episode)."""
+        obstacles_xywh: list[tuple[float, float, float, float]] = []
+        for gid in self._obstacle_geom_ids:
+            if gid < 0:
+                continue
+            wpos = self._data.geom_xpos[gid]
+            if float(wpos[2]) < -10.0:   # hidden slot
+                continue
+            gsize = self._model.geom_size[gid]
+            obstacles_xywh.append((float(wpos[0]), float(wpos[1]),
+                                   float(gsize[0]), float(gsize[1])))
+        self._nav_field = NavField(
+            half_extent=float(self.terrain.arena_half_extent),
+            res=self.nav_field_res,
+            obstacles_xywh=obstacles_xywh,
+            target_xy=(float(target_xy[0]), float(target_xy[1])),
+            inflate=self.nav_field_inflate,
+        )
+
+    def _target_distance(self, pos_xy, euclid: float) -> float:
+        """Distance used by progress shaping. Geodesic (obstacle-aware) in
+        'geodesic' mode when the field has a finite value at the rover cell;
+        otherwise Euclidean fallback."""
+        if self.progress_reward_mode == "geodesic" and self._nav_field is not None:
+            g = self._nav_field.distance(float(pos_xy[0]), float(pos_xy[1]))
+            if g == g:  # not NaN
+                return g
+        return euclid
+
     def _build_obs(self) -> np.ndarray:
         pos_xy, yaw = self._base_pose_xy()
         target = self._current_target()
@@ -384,6 +857,25 @@ class RoverNavEnv(gym.Env):
         c, s = np.cos(yaw), np.sin(yaw)
         rel_fwd   = -s * delta[0] + c * delta[1]   # positive = target AHEAD
         rel_right =  c * delta[0] + s * delta[1]   # positive = target to rover's RIGHT
+
+        # Optionally bend the target bearing along the obstacle-aware geodesic:
+        # keep the (Euclidean) distance magnitude but point the direction the
+        # way the collision-free path leaves the current cell. In open space
+        # the geodesic heading equals the straight-line bearing, so this is a
+        # no-op there (locomotion / obstacle-free tasks unchanged); it only
+        # rotates the bearing when an obstacle actually routes the path.
+        if self.geo_heading_obs and self._nav_field is not None:
+            if self.geo_lookahead_cells > 0:
+                gh = self._nav_field.lookahead_heading(
+                    float(pos_xy[0]), float(pos_xy[1]), self.geo_lookahead_cells)
+            else:
+                gh = self._nav_field.heading(float(pos_xy[0]), float(pos_xy[1]))
+            if gh is not None:
+                wx, wy = gh
+                gfwd = -s * wx + c * wy
+                gright = c * wx + s * wy
+                mag = float(np.hypot(rel_fwd, rel_right))
+                rel_fwd, rel_right = gfwd * mag, gright * mag
         heading_to_goal = float(np.arctan2(rel_right, rel_fwd))
 
         linvel = self._sensor(self._base_linvel_id, 3)[:2]
@@ -409,7 +901,22 @@ class RoverNavEnv(gym.Env):
         # without rebuilding the feature list.
         self._min_obstacle_dist = min_obstacle_dist
 
-        obs = np.empty(6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT, dtype=np.float32)
+        # Body-frame tilt: project the world-up vector into the rover's body
+        # frame. Using the inverse rotation matrix's third column gives the
+        # body-frame components of world-up. Signed so:
+        #   tilt_fwd  > 0 → nose UP (body +Y tilts toward world up)
+        #   tilt_right > 0 → leaning RIGHT (body +X tilts toward world up)
+        # Both are sin(angle); range [-1, 1].
+        quat = self._sensor(self._base_quat_id, 4)
+        w, x, y, z = (float(quat[0]), float(quat[1]),
+                      float(quat[2]), float(quat[3]))
+        tilt_right = -2.0 * (x * z - w * y)
+        tilt_fwd = 2.0 * (y * z + w * x)
+
+        base_dim = (6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+                    + N_TILT_FEATURES + N_PREV_ACTION_FEATURES)
+        obs = np.empty(base_dim + self._n_geo_heading + self._n_lidar,
+                       dtype=np.float32)
         obs[0] = rel_fwd
         obs[1] = rel_right
         obs[2] = heading_to_goal
@@ -418,7 +925,19 @@ class RoverNavEnv(gym.Env):
         obs[5] = angvel_z
         obs[6] = float(rel_fwd_next)
         obs[7] = float(rel_right_next)
-        obs[8:] = obstacle_feats
+        obs_tail = 8 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+        obs[8:obs_tail] = obstacle_feats
+        obs[obs_tail + 0] = tilt_fwd
+        obs[obs_tail + 1] = tilt_right
+        # prev_action is updated at the END of step(); on the first obs of
+        # an episode it's the zero vector set in reset().
+        obs[obs_tail + 2] = float(self._prev_action[0])
+        obs[obs_tail + 3] = float(self._prev_action[1])
+        # Fixed normalization of the base features — see _build_obs_scale.
+        obs[:base_dim] /= OBS_SCALE
+        # Lidar clearances (already in [0, 1]) appended last.
+        if self._n_lidar:
+            obs[base_dim:] = self._cast_lidar(pos_xy, yaw)
         return obs
 
     _WHEEL_GEOM_NAMES = (
@@ -648,6 +1167,17 @@ class RoverNavEnv(gym.Env):
         # at least `stuck_min_progress` metres. Otherwise the rover is "stuck"
         # and we end the episode early.
         self._best_d_target = self._prev_dist
+        # Build the obstacle-aware navigation field for the first target (only
+        # in geodesic mode; cheap Dijkstra on the arena grid). Obstacles are
+        # static within an episode, so this is rebuilt only here and on each
+        # waypoint advance.
+        if self.progress_reward_mode == "geodesic":
+            self._rebuild_nav_field(target)
+        # Every-step closest-approach record for "best"/"geodesic" progress
+        # shaping (see step()); distinct from the 0.5 m-quantised
+        # _best_d_target above. Seeded with the shaping distance (geodesic
+        # when available) so the first step measures progress correctly.
+        self._reward_best_dist = self._target_distance(pos_xy, self._prev_dist)
         self._steps_since_progress = 0
         # Action smoothness: previous step's action, used by the jerk penalty.
         # First step has no prior action; init to zero (no penalty on step 1).
@@ -658,6 +1188,84 @@ class RoverNavEnv(gym.Env):
         self._filtered_action = np.zeros(2, dtype=np.float64)
         obs = self._build_obs()
         return obs, {}
+
+    # ---------------------------------------------------------------- control
+
+    def _apply_ackermann_control(self, throttle: float, steer: float) -> None:
+        """Legacy car-like control: single mirrored steer across the 4 corner
+        knuckles + per-wheel Ackermann speed differential (+ optional skid)."""
+        v_base = -throttle * MAX_WHEEL_VEL  # ctrl sign: positive rolls -Y
+        steer_rad = steer * MAX_STEER_RAD
+        if abs(steer_rad) < 1e-3:
+            wheel_cmd = np.full(6, v_base)
+        else:
+            R = WHEELBASE / np.tan(steer_rad)
+            R_abs = abs(R)
+            mults = np.empty(6)
+            for i, (xw, yw) in enumerate(WHEEL_POS_BODY):
+                mults[i] = np.hypot(xw - R, yw - REAR_AXLE_Y) / R_abs
+            max_mult = float(mults.max())
+            if max_mult > 1.0:
+                mults /= max_mult
+            wheel_cmd = v_base * mults
+        if self.skid_gain > 0.0:
+            dv = steer * self.skid_gain * MAX_WHEEL_VEL
+            wheel_cmd[0:3] += dv
+            wheel_cmd[3:6] -= dv
+            wheel_cmd = np.clip(wheel_cmd, -MAX_WHEEL_VEL, MAX_WHEEL_VEL)
+        self._data.ctrl[0:6] = wheel_cmd
+        # 4-wheel counter-steer: fronts -steer, rears +steer. steer>0 = right.
+        self._data.ctrl[6] = -steer_rad  # right front
+        self._data.ctrl[7] = +steer_rad  # right rear
+        self._data.ctrl[8] = -steer_rad  # left front
+        self._data.ctrl[9] = +steer_rad  # left rear
+
+    def _apply_vw_control(self, v: float, omega: float) -> None:
+        """Rover mobility controller: realise body velocity (v forward, omega
+        yaw) by setting EACH corner knuckle's steer angle and EACH wheel's
+        speed from the rigid-body wheel velocities (independent explicit
+        steering — Curiosity-style). Enables point-turns (v≈0, omega≠0).
+
+        Wheel ground velocity in body frame (right, fwd):
+            v_i = (-omega*y_i,  v + omega*x_i)
+        Corner wheels steer to that heading and drive at its magnitude;
+        headings past ±90° are folded by reversing the wheel. The two middle
+        wheels can't steer (no actuator) → they roll at the forward component
+        and scrub the small lateral part (physical for a fixed mid-wheel).
+        """
+        r = WHEEL_RADIUS
+        wheel_ang = np.empty(6)
+        steer_ang = np.zeros(6)
+        for i, (xi, yi) in enumerate(WHEEL_POS_BODY):
+            vr = -omega * yi
+            vf = v + omega * xi
+            is_middle = (i == 1 or i == 4)
+            if is_middle:
+                wheel_ang[i] = vf / r          # forward component only
+                continue
+            spd = float(np.hypot(vr, vf))
+            ang = float(np.arctan2(vr, vf))    # heading rel forward, +=right
+            if ang > np.pi / 2:
+                ang -= np.pi; spd = -spd
+            elif ang < -np.pi / 2:
+                ang += np.pi; spd = -spd
+            wheel_ang[i] = spd / r
+            steer_ang[i] = ang
+        # Normalise wheel speeds to the (widened) vw wheel-speed cap. Using the
+        # higher VW_MAX_WHEEL_VEL headroom means a turn no longer scales the
+        # forward speed down until ω is large — fixing the arc-stall.
+        mx = float(np.max(np.abs(wheel_ang)))
+        if mx > VW_MAX_WHEEL_VEL:
+            wheel_ang *= VW_MAX_WHEEL_VEL / mx
+        # Drive ctrl: positive ctrl rolls -Y, so forward motion is negative.
+        self._data.ctrl[0:6] = -wheel_ang
+        # Steer ctrl: joint sign is ctrl = -heading (matches the legacy
+        # convention where a right heading came from a negative front ctrl).
+        steer_ang = np.clip(steer_ang, -MAX_STEER_JOINT, MAX_STEER_JOINT)
+        self._data.ctrl[6] = -steer_ang[0]  # right front
+        self._data.ctrl[7] = -steer_ang[2]  # right rear
+        self._data.ctrl[8] = -steer_ang[3]  # left front
+        self._data.ctrl[9] = -steer_ang[5]  # left rear
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         # `action` is what PPO commanded this step; `_filtered_action` is
@@ -677,44 +1285,19 @@ class RoverNavEnv(gym.Env):
         throttle = float(self._filtered_action[0])
         steer    = float(self._filtered_action[1])
 
-        # Per-wheel Ackermann differential. Each wheel's commanded angular
-        # velocity scales with its distance from the instant centre of rotation
-        # (ICR). Without this, every wheel runs at the same speed: the inner
-        # wheels scrub sideways during turns, the lateral scrub force
-        # articulates the rocker-bogie, and the middle wheel lifts off — the
-        # "boogie woogie" symptom. With it, inner-side wheels run slower than
-        # outer-side ones and the chassis pivots cleanly.
-        #
-        # Geometry: with front-wheel steer δ, the ICR sits at body-frame
-        # (R_x, REAR_AXLE_Y) where R_x = WHEELBASE / tan(δ). Each wheel at
-        # (x_w, y_w) has distance from ICR r_w = √((x_w − R_x)² + (y_w − y_rear)²);
-        # its velocity scales as r_w / |R_x|. We then divide by the maximum
-        # multiplier so the fastest wheel hits the user-commanded base velocity
-        # rather than clipping at the actuator's ±MAX_WHEEL_VEL limit — that
-        # preserves the differential ratio across the entire steer range.
-        v_base = -throttle * MAX_WHEEL_VEL  # ctrl sign: positive rolls -Y
-        steer_rad = steer * MAX_STEER_RAD
-        if abs(steer_rad) < 1e-3:
-            self._data.ctrl[0:6] = v_base
+        # Map the (filtered) action to actuator commands via the selected
+        # control mode (see `_apply_vw_control` / `_apply_ackermann_control`).
+        if self.control_mode == "vw":
+            # (v, ω) rover mobility controller sets ctrl[0:10] directly.
+            # FORWARD-ONLY linear velocity: action[0]∈[-1,1] → v∈[0, V_MAX]
+            # (a=-1 → v=0 point-turn, a=+1 → full speed). Reverse is disabled —
+            # it only enabled degenerate wedge/back-out behaviours and is the
+            # standard choice in mapless-nav RL (linear velocity sigmoid-gated
+            # to (0,1)). Turning still spans both directions via ω.
+            v_fwd = 0.5 * (throttle + 1.0) * V_MAX
+            self._apply_vw_control(v_fwd, steer * OMEGA_MAX)
         else:
-            R = WHEELBASE / np.tan(steer_rad)
-            R_abs = abs(R)
-            mults = np.empty(6)
-            for i, (xw, yw) in enumerate(WHEEL_POS_BODY):
-                mults[i] = np.hypot(xw - R, yw - REAR_AXLE_Y) / R_abs
-            max_mult = float(mults.max())
-            if max_mult > 1.0:
-                mults /= max_mult
-            self._data.ctrl[0:6] = v_base * mults
-
-        # 4-wheel Ackermann counter-steer (matches drive_ackermann in the viewer):
-        # steer > 0 turns CW (right). Fronts go -steer, rears go +steer.
-        steer_cmd = steer_rad
-        # Actuator order: 6=right_front, 7=right_rear, 8=left_front, 9=left_rear.
-        self._data.ctrl[6] = -steer_cmd  # right front
-        self._data.ctrl[7] = +steer_cmd  # right rear
-        self._data.ctrl[8] = -steer_cmd  # left front
-        self._data.ctrl[9] = +steer_cmd  # left rear
+            self._apply_ackermann_control(throttle, steer)
         # Hold the arm stowed every step so position actuators don't drift.
         for i, v in enumerate(ARM_STOW_CTRL):
             self._data.ctrl[10 + i] = v
@@ -727,7 +1310,22 @@ class RoverNavEnv(gym.Env):
         target = self._current_target()
         dist = float(np.linalg.norm(target - pos_xy))
 
-        progress = self._prev_dist - dist
+        if self.progress_reward_mode in ("best", "geodesic"):
+            # Reward only NEW closest-approach progress. `_reward_best_dist`
+            # holds the smallest shaping-distance seen so far, updated EVERY
+            # step by any amount (distinct from the 0.5 m-quantised
+            # `_best_d_target` used by the stuck guard). In "geodesic" mode the
+            # shaping distance is the obstacle-aware NavField distance, whose
+            # decrease guides the rover AROUND obstacles; in "best" mode it is
+            # Euclidean. progress = the amount by which this step beats the
+            # record; steps that don't improve it pay 0 (not a negative delta),
+            # so a detour is free, and returning to an already-achieved
+            # distance pays 0 so it can't be reward-farmed.
+            shape_dist = self._target_distance(pos_xy, dist)
+            progress = max(0.0, self._reward_best_dist - shape_dist)
+            self._reward_best_dist = min(self._reward_best_dist, shape_dist)
+        else:
+            progress = self._prev_dist - dist
         self._prev_dist = dist
 
         current_radius = self._target_radii[self._wp_idx]
@@ -746,6 +1344,14 @@ class RoverNavEnv(gym.Env):
                 next_target = self._current_target()
                 dist_to_next = float(np.linalg.norm(next_target - pos_xy))
                 self._prev_dist = dist_to_next
+                # Rebuild the nav field for the new target (obstacles unchanged
+                # within the episode, only the source moves) and reset the
+                # closest-approach record — otherwise the stale small record
+                # from the just-reached waypoint would suppress all reward
+                # toward the next one.
+                if self.progress_reward_mode == "geodesic":
+                    self._rebuild_nav_field(next_target)
+                self._reward_best_dist = self._target_distance(pos_xy, dist_to_next)
                 waypoint_reached_bonus = self.waypoint_bonus
                 self._goal_hold = 0
                 # Adaptive time budget: extend max_steps by enough to give the
@@ -814,6 +1420,12 @@ class RoverNavEnv(gym.Env):
         terminated = success or tipped or early_terminate
         truncated = self._step_count >= self._effective_max_steps
 
+        # Update _prev_action BEFORE building obs so the obs at step t carries
+        # the action that was just applied (action_{t-1} from the policy's
+        # next-decision perspective). Jerk was already computed above against
+        # the old _prev_action, so the order is consistent: jerk uses
+        # (a_now - a_prev), obs publishes a_now.
+        self._prev_action = action.copy()
         obs = self._build_obs()
 
         # Proximity penalty: encourages steering away from obstacles before
@@ -840,10 +1452,24 @@ class RoverNavEnv(gym.Env):
         if success:
             speed_bonus += self.speed_bonus_scale * self.goal_bonus * time_factor
 
+        # Clearance-speed penalty: penalise moving fast near an obstacle so the
+        # rover slows to clear it instead of clipping at speed (see __init__).
+        clearance_speed_penalty = 0.0
+        if (self.clearance_speed_penalty_scale > 0
+                and self.clearance_safe_dist > 0
+                and self._min_obstacle_dist < self.clearance_safe_dist):
+            lv = self._sensor(self._base_linvel_id, 3)
+            spd = float(np.hypot(lv[0], lv[1]))   # planar speed magnitude
+            proximity = 1.0 - self._min_obstacle_dist / self.clearance_safe_dist
+            clearance_speed_penalty = (
+                self.clearance_speed_penalty_scale * spd * proximity
+            )
+
         reward = (
             self.progress_reward_scale * progress
             - self.step_cost
             - proximity_penalty
+            - clearance_speed_penalty
             - (self.collision_penalty if collision else 0.0)
             - (self.hit_penalty if new_hit else 0.0)
             - (self.tipped_penalty if tipped else 0.0)
@@ -866,8 +1492,6 @@ class RoverNavEnv(gym.Env):
         # state access. Cheap (3 floats / step) and lets `rollout_with_trajectory`
         # build top-down path plots without coupling to env internals.
         _, yaw_now = self._base_pose_xy()
-        # Remember this action for next-step jerk.
-        self._prev_action = action.copy()
 
         info: dict[str, Any] = {
             "distance_to_goal": dist_to_goal,

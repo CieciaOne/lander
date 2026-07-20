@@ -48,7 +48,6 @@ def test_fisher_computed_after_train_on():
     cl = EwcCL(
         lam=1000.0,
         fisher_sample_size=64,
-        penalty_steps=4,
         ppo_kwargs=FAST_PPO,
     )
     env = _env()
@@ -68,7 +67,6 @@ def test_no_penalty_on_first_task():
     cl = EwcCL(
         lam=1000.0,
         fisher_sample_size=64,
-        penalty_steps=5,
         ppo_kwargs=FAST_PPO,
     )
     env_a, env_b = _env(), _env()
@@ -76,63 +74,81 @@ def test_no_penalty_on_first_task():
     assert cl.last_penalty_steps_run == 0
 
     cl.train_on(env_b, TINY_STEPS, task_id="T2")
+    # With the hook mechanism, last_penalty_steps_run counts backward passes
+    # that carried the penalty gradient — one per PPO minibatch update.
     assert cl.last_penalty_steps_run > 0
-    assert cl.last_penalty_steps_run == 5
+    assert cl.last_penalty_value >= 0.0
 
     env_a.close()
     env_b.close()
 
 
 @pytest.mark.slow
-def test_lambda_zero_disables_protection():
-    """With lam=0 the penalty-step loop still runs but produces zero gradient.
+def test_penalty_hook_adds_analytic_gradient():
+    """The gradient hook must add exactly lam * F * (p - theta*) to grads.
 
-    Verification: we manually invoke _apply_ewc_penalty after clearing Adam's
-    internal momentum buffers, then compare params. With lam=0 the loss is
-    identically zero, its gradient is zero, and with no carried momentum Adam
-    must leave the params unchanged.
+    We train one task to populate fisher/theta_star, then compute gradients
+    of a fixed loss twice — with and without hooks installed — and check the
+    difference against the analytic penalty gradient. This verifies the
+    penalty is integrated into the backward pass (not a separate pull-back)
+    and that lam=0 makes it an exact no-op.
     """
-    cl = EwcCL(
-        lam=0.0,
-        fisher_sample_size=64,
-        penalty_steps=10,
-        ppo_kwargs=FAST_PPO,
-    )
-    env_a, env_b = _env(), _env()
-    cl.train_on(env_a, TINY_STEPS, task_id="A")
-    cl.train_on(env_b, TINY_STEPS, task_id="B")
-    assert cl.last_penalty_steps_run > 0
+    cl = EwcCL(lam=123.0, fisher_sample_size=64, ppo_kwargs=FAST_PPO)
+    env = _env()
+    cl.train_on(env, TINY_STEPS, task_id="A")
+    env.close()
 
-    # Clear any optimizer momentum from PPO's prior updates so we can isolate
-    # the effect of the EWC penalty step itself. We rebuild a fresh Adam at
-    # the same LR so its internal state is empty.
-    old_opt = cl.model.policy.optimizer
-    lr = old_opt.param_groups[0]["lr"]
-    cl.model.policy.optimizer = th.optim.Adam(
-        cl.model.policy.parameters(), lr=lr
-    )
+    policy = cl.model.policy
+    obs_t = th.randn(8, 3)   # Pendulum obs dim = 3
+    act_t = th.randn(8, 1)   # Pendulum act dim = 1
 
-    before = {
-        n: p.detach().clone()
-        for n, p in cl.model.policy.named_parameters()
-        if p.requires_grad
-    }
-    cl._apply_ewc_penalty([tid for tid in cl.fisher if tid != "B"])
-    after = {
-        n: p.detach().clone()
-        for n, p in cl.model.policy.named_parameters()
-        if p.requires_grad
-    }
-    max_abs_diff = max(
-        float((after[n] - before[n]).abs().max().item()) for n in before
-    )
-    assert max_abs_diff < 1e-8, (
-        f"lam=0 should be a no-op for penalty steps, but params drifted by "
-        f"{max_abs_diff}"
-    )
+    def grads_of_fixed_loss() -> dict[str, th.Tensor]:
+        policy.zero_grad()
+        _v, log_prob, _e = policy.evaluate_actions(obs_t, act_t)
+        (-log_prob.mean()).backward()
+        return {
+            n: p.grad.detach().clone()
+            for n, p in policy.named_parameters()
+            if p.grad is not None
+        }
 
-    env_a.close()
-    env_b.close()
+    grads_plain = grads_of_fixed_loss()
+    handles = cl._install_penalty_hooks(["A"])
+    try:
+        grads_hooked = grads_of_fixed_loss()
+    finally:
+        for h in handles:
+            h.remove()
+    policy.zero_grad()
+
+    for n, g_hooked in grads_hooked.items():
+        if n not in cl.fisher["A"]:
+            continue
+        expected = cl.lam * cl.fisher["A"][n] * (
+            dict(policy.named_parameters())[n].detach() - cl.theta_star["A"][n]
+        )
+        actual = g_hooked - grads_plain[n]
+        np.testing.assert_allclose(
+            actual.cpu().numpy(), expected.cpu().numpy(),
+            rtol=1e-4, atol=1e-6,
+            err_msg=f"penalty gradient mismatch on {n}",
+        )
+
+    # lam=0 → hooks must be an exact no-op.
+    cl.lam = 0.0
+    handles = cl._install_penalty_hooks(["A"])
+    try:
+        grads_lam0 = grads_of_fixed_loss()
+    finally:
+        for h in handles:
+            h.remove()
+    policy.zero_grad()
+    for n, g in grads_lam0.items():
+        np.testing.assert_allclose(
+            g.cpu().numpy(), grads_plain[n].cpu().numpy(),
+            rtol=1e-6, atol=1e-8,
+            err_msg=f"lam=0 hook changed gradient on {n}",
+        )
 
 
 @pytest.mark.slow
@@ -140,7 +156,6 @@ def test_save_load_roundtrips_fisher(tmp_path: Path):
     cl = EwcCL(
         lam=500.0,
         fisher_sample_size=64,
-        penalty_steps=3,
         ppo_kwargs=FAST_PPO,
     )
     env = _env()
@@ -206,22 +221,17 @@ def test_ewc_pulls_params_toward_theta_star():
     random PPO trajectories during task A leave the two methods at different
     starting points for task B, and (2) the EWC penalty itself. To isolate (2)
     we compare two EwcCL runs with identical hyperparameters and seeds, except
-    one has ``penalty_steps=0`` (effectively Naive on B) and the other has the
-    full penalty active. Both have the same post-A model + theta_star, so the
-    only difference is whether the penalty fires.
-
-    We use ``lam=1e3`` (the default) — much larger values saturate Adam's
-    normalization and cause the penalty to oscillate around theta_star instead
-    of converging, weakening the structural signal.
+    one has ``lam=0`` (penalty gradient identically zero — effectively Naive
+    on B) and the other has the full penalty active. Both have the same
+    post-A model + theta_star, so the only difference is the penalty.
     """
     seed = 0
 
     th.manual_seed(seed)
     np.random.seed(seed)
     ewc_off = EwcCL(
-        lam=1e3,
+        lam=0.0,
         fisher_sample_size=128,
-        penalty_steps=0,
         ppo_kwargs=FAST_PPO,
     )
     env_a, env_b = _env(), _env()
@@ -244,7 +254,6 @@ def test_ewc_pulls_params_toward_theta_star():
     ewc_on = EwcCL(
         lam=1e3,
         fisher_sample_size=128,
-        penalty_steps=50,
         ppo_kwargs=FAST_PPO,
     )
     env_a, env_b = _env(), _env()
@@ -262,9 +271,10 @@ def test_ewc_pulls_params_toward_theta_star():
     env_a.close()
     env_b.close()
 
-    # Structural guarantee: penalty did run.
-    assert ewc_on.last_penalty_steps_run == 50
-    assert ewc_off.last_penalty_steps_run == 0
+    # Structural guarantee: penalty-carrying backward passes did run in the
+    # "on" variant. (The lam=0 variant also installs hooks — past task exists
+    # — but its penalty gradient is identically zero.)
+    assert ewc_on.last_penalty_steps_run > 0
 
     # The penalty must pull params closer to theta_star_A than no penalty.
     assert dist_on < dist_off, (

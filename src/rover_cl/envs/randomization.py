@@ -495,3 +495,197 @@ def sample_obstacles_along_path(
         sizes.append((0.1, 0.1, 0.1))
 
     return positions, sizes
+
+
+def sample_obstacles_corridor(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    goal: tuple[float, float],
+    n_obstacles: int,
+    max_slots: int,
+    size_range: tuple[float, float] = (0.4, 0.6),
+    t_lo: float = 0.30,
+    t_hi: float = 0.90,
+    lateral: float = 1.1,
+    heightmap: np.ndarray | None = None,
+    heightmap_extent: tuple[float, float, float] = (15.0, 15.0, 0.0),
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    """Place `n_obstacles` in the CORRIDOR along the start→goal line — spread
+    over path fraction t∈[t_lo, t_hi] with a small lateral offset — so they
+    GENUINELY BLOCK the direct route (forcing the rover to weave) while starting
+    far enough along (t_lo≈0.3 ⇒ ~2.8 m ahead) that the rover is never spawned
+    on top of one.
+
+    The "genuinely challenging but fair" middle ground: `sample_obstacles_along
+    _path` puts obstacles ~1 m from spawn (adversarial, unlearnable);
+    `sample_scattered_obstacles` scatters them arena-wide (~2% actually block →
+    trivial). This blocks ~100% of episodes with 2-4 obstacles yet gives
+    reaction distance. See docs/decision-log.md.
+    """
+    sx, sy = start
+    gx, gy = goal
+    dx, dy = gx - sx, gy - sy
+    L = (dx * dx + dy * dy) ** 0.5
+    fx, fy = (dx / L, dy / L) if L > 1e-6 else (0.0, 1.0)
+    lx, ly = -fy, fx
+    positions: list[tuple[float, float, float]] = []
+    sizes: list[tuple[float, float, float]] = []
+    ts = np.linspace(t_lo, t_hi, n_obstacles) if n_obstacles > 0 else []
+    for t in ts:
+        t = float(t + rng.uniform(-0.06, 0.06))
+        perp = float(rng.uniform(-lateral, lateral))
+        s = float(rng.uniform(*size_range))
+        ox = sx + t * dx + perp * lx
+        oy = sy + t * dy + perp * ly
+        surface_z = heightmap_height_at_xy(heightmap, heightmap_extent, ox, oy)
+        positions.append((ox, oy, surface_z + s))
+        sizes.append((s, s, s))
+    for _ in range(len(positions), max_slots):
+        positions.append((0.0, 0.0, HIDE_Z))
+        sizes.append((0.1, 0.1, 0.1))
+    return positions, sizes
+
+
+def sample_scattered_obstacles(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    goal: tuple[float, float],
+    n_obstacles: int,
+    max_slots: int,
+    size_range: tuple[float, float] = (0.4, 0.6),
+    arena_half: float = 11.0,
+    clearance_from_ends: float = 3.0,
+    min_apart: float = 2.2,
+    heightmap: np.ndarray | None = None,
+    heightmap_extent: tuple[float, float, float] = (15.0, 15.0, 0.0),
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    """Scatter `n_obstacles` boxes RANDOMLY across the arena (an obstacle
+    FIELD), rejecting positions within `clearance_from_ends` of the start or
+    goal and within `min_apart` of another obstacle.
+
+    This is the realistic mapless-navigation obstacle distribution (a field the
+    rover routes through), as opposed to `sample_obstacles_along_path`, which
+    drops obstacles ON the direct start→goal line (as close as ~1 m to the
+    spawn). The on-path placement made avoidance adversarial/often-impossible
+    and was the root cause of the obstacle-navigation failures; scattered
+    placement with spawn clearance is readily learnable to ~90% success (with
+    lidar + vw control). See docs/decision-log.md.
+
+    Hidden slots pad to `max_slots` with the HIDE_Z sentinel.
+    """
+    positions: list[tuple[float, float, float]] = []
+    sizes: list[tuple[float, float, float]] = []
+    tries = 0
+    while len(positions) < n_obstacles and tries < 400:
+        tries += 1
+        x = float(rng.uniform(-arena_half, arena_half))
+        y = float(rng.uniform(-arena_half, arena_half))
+        if np.hypot(x - start[0], y - start[1]) < clearance_from_ends:
+            continue
+        if np.hypot(x - goal[0], y - goal[1]) < clearance_from_ends:
+            continue
+        if any(np.hypot(x - px, y - py) < min_apart for px, py, _ in positions):
+            continue
+        s = float(rng.uniform(*size_range))
+        surface_z = heightmap_height_at_xy(heightmap, heightmap_extent, x, y)
+        positions.append((x, y, surface_z + s))
+        sizes.append((s, s, s))
+
+    for _ in range(len(positions), max_slots):
+        positions.append((0.0, 0.0, HIDE_Z))
+        sizes.append((0.1, 0.1, 0.1))
+
+    return positions, sizes
+
+
+def sample_obstacles_slalom(
+    rng: np.random.Generator,
+    start: tuple[float, float],
+    goal: tuple[float, float],
+    n_obstacles: int,
+    max_slots: int,
+    size_range: tuple[float, float] = (0.4, 0.6),
+    corridor_half: float = 3.0,
+    gap_min: float = 2.2,
+    footprint: float = 0.9,
+    clearance_ends: float = 2.6,
+    min_spacing: float = 2.4,
+    return_gaps: bool = False,
+    heightmap: np.ndarray | None = None,
+    heightmap_extent: tuple[float, float, float] = (15.0, 15.0, 0.0),
+):
+    """Place obstacles as a GUARANTEED-FEASIBLE slalom along the start→goal line.
+
+    Each obstacle straddles the centreline (so the straight path is genuinely
+    blocked and the rover MUST weave) but is pushed to one side — alternating
+    left/right down the corridor — so that a clear band of width >= `gap_min`
+    always remains on the opposite side for the rover CENTRE to pass through.
+    Because the rover footprint (`footprint`, ~0.9 m radius ⇒ 1.8 m diameter)
+    is accounted for, `gap_min` is the clearance for the rover centre; with
+    gap_min=2.2 the rover has ~0.4 m margin.
+
+    Obstacles are kept at least `clearance_ends` metres (ABSOLUTE, not a path
+    fraction) from both start and goal, and at least `min_spacing` apart in the
+    forward direction — so the achievable count SCALES WITH PATH LENGTH (a 6 m
+    path fits ~1 gate, a 12 m path ~3-4). This is essential: obstacle inflation
+    is ~1.5 m, so an obstacle placed by path-fraction near t≈0.9 on a short path
+    would engulf the goal cell and make the config unsolvable — the defect that
+    left `sample_obstacles_corridor` only ~26% feasible (obstacles crammed into
+    a ±1.1 m band merging into an impassable wall / swallowing the endpoints).
+    The slalom is a genuine plural-obstacle avoidance task that is ~100%
+    solvable. See docs/decision-log.md.
+    """
+    sx, sy = start
+    gx, gy = goal
+    dx, dy = gx - sx, gy - sy
+    L = (dx * dx + dy * dy) ** 0.5
+    fx, fy = (dx / L, dy / L) if L > 1e-6 else (0.0, 1.0)
+    lx, ly = -fy, fx  # unit lateral
+
+    positions: list[tuple[float, float, float]] = []
+    sizes: list[tuple[float, float, float]] = []
+    gaps: list[tuple[float, float]] = []  # world (x, y) at the CLEAR gap of each gate
+
+    # Usable forward span keeps obstacles clear of BOTH endpoints (absolute
+    # metres, since inflation is absolute). Count is capped so consecutive gates
+    # are >= min_spacing apart — hence obstacle count scales with path length.
+    d_lo = clearance_ends
+    d_hi = L - clearance_ends
+    span = max(0.0, d_hi - d_lo)
+    n_feasible = 0 if span <= 0 else int(span / min_spacing) + 1
+    n_eff = int(min(n_obstacles, n_feasible)) if n_obstacles > 0 else 0
+
+    ds = np.linspace(d_lo, d_hi, n_eff) if n_eff > 0 else []
+    jitter = min(min_spacing * 0.2, 0.4)
+    for k, dfwd in enumerate(ds):
+        dfwd = float(dfwd + rng.uniform(-jitter, jitter))
+        t = dfwd / L if L > 1e-6 else 0.5
+        side = 1.0 if (k % 2 == 0) else -1.0
+        if rng.uniform() < 0.5:      # randomise which side the slalom starts on
+            side = -side
+        s = float(rng.uniform(*size_range))
+        infl = s + footprint
+        # Centre offset c on the blocked side: block the centreline (c <= infl)
+        # yet leave >= gap_min clear on the open side (c >= gap_min - corridor_half + infl).
+        c_lo = max(0.0, gap_min - corridor_half + infl)
+        c_hi = infl
+        c = c_lo if c_hi <= c_lo else float(rng.uniform(c_lo, c_hi))
+        perp = side * c
+        ox = sx + t * dx + perp * lx
+        oy = sy + t * dy + perp * ly
+        surface_z = heightmap_height_at_xy(heightmap, heightmap_extent, ox, oy)
+        positions.append((ox, oy, surface_z + s))
+        sizes.append((s, s, s))
+        # Centre of the CLEAR band on the open side (opposite the obstacle) at
+        # this gate's forward position — a guaranteed-collision-free waypoint
+        # that also guides the rover through the weave.
+        gap_lat = -side * (corridor_half + infl - c) * 0.5
+        gaps.append((sx + t * dx + gap_lat * lx, sy + t * dy + gap_lat * ly))
+
+    for _ in range(len(positions), max_slots):
+        positions.append((0.0, 0.0, HIDE_Z))
+        sizes.append((0.1, 0.1, 0.1))
+
+    if return_gaps:
+        return positions, sizes, gaps
+    return positions, sizes

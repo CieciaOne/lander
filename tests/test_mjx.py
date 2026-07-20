@@ -97,17 +97,17 @@ def test_mjx_env_max_targets_covers_catalog():
 def test_mjx_vec_env_basic_step():
     vec = MjxVecEnv(terrain="T1_flat", n_envs=2, seed=0, max_steps=80)
     assert vec.num_envs == 2
-    assert vec.observation_space.shape == (40,)
+    assert vec.observation_space.shape == (44,)
     assert vec.action_space.shape == (2,)
 
     obs = vec.reset()
-    assert obs.shape == (2, 40)
+    assert obs.shape == (2, 44)
     assert obs.dtype == np.float32
 
     actions = np.zeros((2, 2), dtype=np.float32)
     actions[:, 0] = 1.0
     obs, rew, done, info = vec.step(actions)
-    assert obs.shape == (2, 40)
+    assert obs.shape == (2, 44)
     assert rew.shape == (2,)
     assert done.shape == (2,)
     assert len(info) == 2

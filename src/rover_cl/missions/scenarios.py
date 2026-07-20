@@ -31,9 +31,11 @@ from .base import Mission, Task
 from rover_cl.envs import RoverNavEnv
 
 
-def _env_factory(terrain_name: str, max_steps: int = 500):
+def _env_factory(terrain_name: str, max_steps: int = 500,
+                 env_kwargs: dict | None = None):
+    ekw = dict(env_kwargs or {})
     def _make(seed: int):
-        return RoverNavEnv(terrain=terrain_name, max_steps=max_steps, seed=seed)
+        return RoverNavEnv(terrain=terrain_name, max_steps=max_steps, seed=seed, **ekw)
     return _make
 
 
@@ -47,13 +49,14 @@ def _make_task(
     min_success_to_advance: float | None = None,
     max_budget_multiplier: float = 2.0,
     gate_check_interval: int = 50_000,
-    gate_eval_episodes: int = 8,
+    gate_eval_episodes: int = 16,
     interim_eval_every: int = 0,
     interim_eval_episodes: int = 5,
+    env_kwargs: dict | None = None,
 ) -> Task:
     return Task(
         terrain_name,
-        _env_factory(terrain_name, max_steps),
+        _env_factory(terrain_name, max_steps, env_kwargs),
         train_timesteps=train_timesteps,
         eval_episodes=eval_episodes,
         eval_max_steps=max_steps,
@@ -474,7 +477,7 @@ def scenario_11_robust_generalist(
             min_success_to_advance=threshold if enable_gate else None,
             max_budget_multiplier=2.0,
             gate_check_interval=50_000,
-            gate_eval_episodes=8,
+            gate_eval_episodes=16,
             interim_eval_every=interim_every,
             interim_eval_episodes=5,
         ))
@@ -494,12 +497,19 @@ def scenario_12_joint_training(
     max_steps: int = 1500,
     seed: int = 0,
 ) -> Mission:
-    """Joint-training baseline — train PPO directly on RC_full_random.
+    """Joint-training baseline — PPO on a uniform mixture of all curriculum
+    sub-distributions.
 
-    No curriculum, no continual-learning protection. Just sample from the
-    full distribution every batch. This is the joint-training upper bound
-    that all CL methods in the thesis are compared against, AND the most
-    practical deployable >90% policy candidate.
+    Trains on `RC_joint_mixture`, which per-episode picks one of the four
+    distributions visited sequentially by scenario_13 (foundation /
+    navigation / navigation_terrain / full_random) with equal probability.
+    This is the proper "no curriculum, no CL machinery" upper-bound baseline:
+    every batch is a uniform draw over the full training distribution.
+
+    Previous version pointed at `RC_full_random` only — the hardest
+    distribution — which gave PPO no successful trajectories to bootstrap
+    from. The mixture preserves the same overall coverage as the curriculum
+    but lets early policies learn from the easy episodes.
 
     `cl_method` defaults to 'naive' (no CL machinery — there's nothing to
     protect across phases, only one phase). The Runner still creates the
@@ -510,12 +520,18 @@ def scenario_12_joint_training(
     """
     tasks = [
         _make_task(
-            "RC_full_random",
+            "RC_joint_mixture",
             train_timesteps,
             eval_episodes, max_steps,
             ent_coef=0.02,
             # No advance gate (only one phase, nothing to advance to).
             min_success_to_advance=None,
+            # Cap budget at exactly `train_timesteps`. The default
+            # `_make_task` multiplier of 2.0 was for gated phases that
+            # might need extra budget to cross a threshold — irrelevant
+            # here. Without this, the actual training budget silently
+            # doubled (the `5M / 10M` in the previous log).
+            max_budget_multiplier=1.0,
             # Interim eval every 100k so we can watch the learning curve
             # without polluting the log.
             interim_eval_every=100_000,
@@ -585,7 +601,7 @@ def scenario_13_integrated_curriculum(
             min_success_to_advance=threshold if enable_gate else None,
             max_budget_multiplier=2.0,
             gate_check_interval=50_000,
-            gate_eval_episodes=8,
+            gate_eval_episodes=16,
             interim_eval_every=interim_every,
             interim_eval_episodes=5,
         ))
@@ -595,6 +611,101 @@ def scenario_13_integrated_curriculum(
         cl_method=cl_method,
         cl_kwargs=cl_kwargs,
         seed=seed,
+    )
+
+
+def scenario_14_skill_sequence(
+    cl_method: str = "naive",
+    train_timesteps: int = 1_000_000,
+    eval_episodes: int = 30,
+    max_steps: int = 1000,
+    seed: int = 0,
+    ewc_lam: float = 1000.0,
+) -> Mission:
+    """Clean 3-task continual-learning forgetting benchmark.
+
+    Built after a learnability audit established that BLOCKING-obstacle
+    avoidance is not reliably learnable in this env (~5%), while other skill
+    axes are. This sequence uses only individually-learnable tasks (measured
+    single-task success in parentheses), each a distinct navigation SKILL, so
+    the retention matrix reflects genuine forgetting rather than tasks that
+    never learned:
+
+        Phase 0  RC_locomotion     — drive to goals over varied distance and
+                                      bearing; requires turning-from-rest (~92%)
+        Phase 1  RC_path_following — track multi-waypoint chains (arcs, slalom,
+                                      twisty); a different control behaviour
+                                      from single-goal driving              (~50%)
+        Phase 2  RC_terrain        — traverse procedural heightmaps (flat →
+                                      hills → dunes); terrain adaptation     (~45%)
+
+    None of the three has obstacles, so the geodesic progress reward reduces
+    to Euclidean and the tasks are exactly the learnable axes. The three
+    demand different policies (single-goal turning vs waypoint tracking vs
+    dune traversal), so naive sequential training is expected to forget
+    earlier skills — the signal the CL methods are compared on.
+
+    Fixed budget per task (no adaptive gate) so every method trains each skill
+    under identical conditions; retention is evaluated on all seen tasks after
+    every phase (Runner default).
+    """
+    task_terrains = ["RC_locomotion", "RC_path_following", "RC_terrain"]
+    cl_kwargs: dict = {"lam": ewc_lam} if cl_method in ("ewc", "l2", "mas", "hybrid") else {}
+    tasks = [
+        _make_task(
+            terrain, train_timesteps, eval_episodes, max_steps,
+            ent_coef=0.02,
+            interim_eval_every=100_000,
+            interim_eval_episodes=10,
+        )
+        for terrain in task_terrains
+    ]
+    return Mission(
+        name=f"scenario_14_skill_sequence_{cl_method}",
+        tasks=tasks,
+        cl_method=cl_method,
+        cl_kwargs=cl_kwargs,
+        seed=seed,
+    )
+
+
+def scenario_15_obstacle_field(
+    cl_method: str = "naive",
+    train_timesteps: int = 20_000_000,
+    eval_episodes: int = 30,
+    max_steps: int = 1800,
+    seed: int = 0,
+) -> Mission:
+    """Reactive obstacle-field navigation with realistic Curiosity-style
+    control. Single long phase on `RC_field` (scattered obstacles + waypoints).
+
+    Uses the obstacle-aware env config — lidar range scan + `(v, ω)` mobility
+    (independent corner steering + point-turn, matching real Curiosity) —
+    and premise-consistent LOCAL perception only (no global map/planner). Reaches
+    ~90% on 3-5 obstacles + 1-2 waypoints, robust to denser fields (see
+    docs/decision-log.md). This is the "unknown terrain, react to what you
+    sense" formulation; the earlier on-path obstacle scenarios were an
+    adversarial mis-design that was not learnable.
+
+    NOTE: a from-scratch run benefits from a brief close-goal locomotion
+    bootstrap before the field distribution (the /tmp/field20m.py recipe);
+    the single-phase form here is the deployable/eval definition.
+    """
+    ekw = dict(use_lidar=True, control_mode="vw", geo_heading_obs=False,
+               progress_reward_mode="best", collision_terminate_steps=1,
+               collision_penalty=0.0, hit_penalty=5.0,
+               stuck_in_collision_penalty=25.0)
+    tasks = [
+        _make_task(
+            "RC_field", train_timesteps, eval_episodes, max_steps,
+            ent_coef=0.01, max_budget_multiplier=1.0,
+            interim_eval_every=500_000, interim_eval_episodes=20,
+            env_kwargs=ekw,
+        )
+    ]
+    return Mission(
+        name=f"scenario_15_obstacle_field_{cl_method}",
+        tasks=tasks, cl_method=cl_method, cl_kwargs={}, seed=seed,
     )
 
 
@@ -638,6 +749,8 @@ SCENARIO_REGISTRY = {
     "scenario_11_robust_generalist": scenario_11_robust_generalist,
     "scenario_12_joint_training": scenario_12_joint_training,
     "scenario_13_integrated_curriculum": scenario_13_integrated_curriculum,
+    "scenario_14_skill_sequence": scenario_14_skill_sequence,
+    "scenario_15_obstacle_field": scenario_15_obstacle_field,
     # Stubs (raise NotImplementedError on call but registered so they're discoverable):
     "scenario_02_threat_classes": scenario_02_threat_classes,
     "scenario_06_fusion": scenario_06_fusion,

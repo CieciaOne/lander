@@ -87,7 +87,7 @@ def test_hybrid_runs_both_rehearsal_and_penalty(tmp_path):
     AND non-empty Fisher snapshot. The unit-test for "is this really
     a hybrid"."""
     cl = HybridEwcReplayCL(buffer_size_per_task=50, fisher_sample_size=20,
-                          rehearsal_steps=5, penalty_steps=5)
+                          rehearsal_steps=5)
     env_a = _tiny_env(seed=0)
     cl.train_on(env=env_a, total_timesteps=400, task_id="A", log_dir=None)
     env_a.close()
@@ -133,7 +133,7 @@ def test_distill_stores_teacher_and_obs_buffer():
 def test_scenario_12_joint_training_builds():
     m = get_scenario("scenario_12_joint_training", train_timesteps=10_000, seed=0)
     assert len(m.tasks) == 1
-    assert m.tasks[0].task_id == "RC_full_random"
+    assert m.tasks[0].task_id == "RC_joint_mixture"
     assert m.cl_method == "naive"
 
 

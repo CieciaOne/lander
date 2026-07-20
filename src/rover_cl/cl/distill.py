@@ -59,6 +59,7 @@ class DistillCL(BaseCLMethod):
         # Per-task frozen teacher state_dicts (cpu tensors, no grad).
         self.teachers: dict[str, dict[str, th.Tensor]] = {}
         self.last_distill_steps_run: int = 0
+        self.last_distill_kl: float = 0.0
 
     # ====================================================================== main
 
@@ -162,6 +163,7 @@ class DistillCL(BaseCLMethod):
             g["lr"] = self.distill_lr
 
         steps_done = 0
+        last_kl = 0.0
         try:
             for _ in range(self.distill_steps):
                 # Sample a batch of obs from a randomly-chosen past task.
@@ -192,11 +194,16 @@ class DistillCL(BaseCLMethod):
                 loss.backward()
                 optimizer.step()
                 steps_done += 1
+                last_kl = float(kl.mean().item())
         finally:
             for g, lr in zip(optimizer.param_groups, original_lrs):
                 g["lr"] = lr
 
         self.last_distill_steps_run = steps_done
+        # Residual KL to the teacher(s) after the distill pass — if this
+        # stays high (or equals the pre-distill value), the pass is a no-op
+        # and distill_steps / distill_lr need raising.
+        self.last_distill_kl = last_kl
 
     # ====================================================================== buffer
 

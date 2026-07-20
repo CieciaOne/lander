@@ -3,13 +3,20 @@
 After each task k completes, we estimate the diagonal Fisher information of the
 policy parameters by replaying transitions and accumulating squared gradients of
 ``-log_prob(action | obs)``. We also snapshot the post-training parameters
-``theta_star``. When subsequent tasks (k+1, k+2, ...) train, an extra penalty
+``theta_star``. When subsequent tasks (k+1, k+2, ...) train, the penalty
 
     L_ewc = (lam / 2) * sum_tasks sum_params fisher_task[p] * (p - theta_star_task[p])^2
 
-is minimized via a small number of dedicated gradient steps on the same
-optimizer AFTER `model.learn(...)`. This keeps the implementation independent of
-SB3's internal PPO loss and matches the most common public EWC-for-PPO pattern.
+is integrated INTO the PPO loss for every gradient step, via per-parameter
+gradient hooks: each hook adds the analytic penalty gradient
+``lam * fisher * (p - theta_star)`` to the parameter's gradient during the
+backward pass of PPO's loss. This is mathematically identical to adding the
+penalty term to the loss itself, but requires no SB3 subclassing.
+
+(Earlier versions applied the penalty as a separate SGD pull-back pass AFTER
+`model.learn()` — a "periodic consolidation" variant. That let PPO drift
+unconstrained for an entire phase before any correction, which is not the
+EWC from the literature and empirically under-protected old tasks.)
 """
 
 from __future__ import annotations
@@ -31,28 +38,21 @@ class EwcCL(BaseCLMethod):
         self,
         lam: float = 1000.0,
         fisher_sample_size: int = 512,
-        penalty_steps: int = 50,
-        penalty_lr: float = 1e-3,
-        penalty_grad_clip: float = 1.0,
         ppo_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(ppo_kwargs=ppo_kwargs)
         self.lam = float(lam)
         self.fisher_sample_size = int(fisher_sample_size)
-        self.penalty_steps = int(penalty_steps)
-        # We use a *fresh* SGD optimizer for the EWC penalty pass instead of
-        # reusing the policy's Adam optimizer. Adam's running v_t is calibrated
-        # for PPO-scale gradients (small); when the much larger penalty
-        # gradients hit it, the adaptive LR overshoots and pushes params AWAY
-        # from theta_star — empirically verified to flip the EWC direction.
-        # SGD with a small fixed lr is well-behaved and matches what most
-        # public EWC-for-PPO implementations do.
-        self.penalty_lr = float(penalty_lr)
-        self.penalty_grad_clip = float(penalty_grad_clip)
         # task_id -> { param_name -> Tensor } (both on policy device, no grad).
         self.fisher: dict[str, dict[str, th.Tensor]] = {}
         self.theta_star: dict[str, dict[str, th.Tensor]] = {}
+        # Diagnostics, refreshed per train_on call:
+        #   last_penalty_steps_run — number of backward passes that included
+        #     the penalty gradient (0 on the first task).
+        #   last_penalty_value — the penalty term 0.5*lam*sum(F*(θ-θ*)^2)
+        #     measured AFTER training, i.e. the residual drift cost.
         self.last_penalty_steps_run: int = 0
+        self.last_penalty_value: float = 0.0
 
     # ---------- main entry ----------
 
@@ -69,26 +69,33 @@ class EwcCL(BaseCLMethod):
         self._ensure_model(env, log_dir)
         assert self.model is not None
 
+        # Install gradient hooks so the EWC penalty gradient rides along with
+        # every PPO backward pass during learn(). Removed afterwards so the
+        # Fisher-collection backward in post_train stays clean.
+        past_ids = [tid for tid in self.fisher if tid != task_id]
+        handles = self._install_penalty_hooks(past_ids) if past_ids else []
+
         _ent_restore = None
         if ent_coef is not None:
             _ent_restore = float(self.model.ent_coef)
             self.model.ent_coef = float(ent_coef)
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            reset_num_timesteps=False,
-            tb_log_name=f"ewc_{task_id}",
-            callback=callback,
-        )
+        try:
+            self.model.learn(
+                total_timesteps=total_timesteps,
+                reset_num_timesteps=False,
+                tb_log_name=f"ewc_{task_id}",
+                callback=callback,
+            )
+        finally:
+            for h in handles:
+                h.remove()
         if _ent_restore is not None:
             self.model.ent_coef = _ent_restore
 
-        # If we already have Fisher info for previous tasks, pull params back
-        # toward their snapshots via N dedicated penalty-only gradient steps.
-        past_ids = [tid for tid in self.fisher if tid != task_id]
-        if past_ids:
-            self._apply_ewc_penalty(past_ids)
-        else:
-            self.last_penalty_steps_run = 0
+        self.last_penalty_steps_run = self._hook_backward_count if past_ids else 0
+        self.last_penalty_value = (
+            self._compute_penalty_value(past_ids) if past_ids else 0.0
+        )
 
         if task_id not in self.seen_task_ids:
             self.seen_task_ids.append(task_id)
@@ -113,44 +120,75 @@ class EwcCL(BaseCLMethod):
             if p.requires_grad
         }
 
-    def _apply_ewc_penalty(self, past_ids: list[str]) -> None:
+    def _install_penalty_hooks(self, past_ids: list[str]) -> list:
+        """Register per-parameter gradient hooks implementing the EWC penalty.
+
+        For each policy parameter p protected by at least one past task, the
+        hook adds ``lam * sum_t F_t * (p - theta*_t)`` to p's gradient during
+        every backward pass. This is the analytic gradient of
+        ``0.5 * lam * sum_t F_t * (p - theta*_t)^2`` — mathematically the same
+        as adding the penalty term to PPO's loss, without subclassing SB3.
+
+        The hooks also run during the rollout phase's occasional backward-free
+        forward passes harmlessly (hooks only fire on backward). They MUST be
+        removed before Fisher collection, or the penalty gradient would
+        contaminate the squared-gradient Fisher estimate — `train_on` removes
+        them in a finally block.
+
+        Returns the list of hook handles; caller removes them after learn().
+        """
         assert self.model is not None
         policy = self.model.policy
+        handles = []
+        self._hook_backward_count = 0
+        first_param_hooked = True
+        for n, p in policy.named_parameters():
+            if not p.requires_grad:
+                continue
+            terms: list[tuple[th.Tensor, th.Tensor]] = []
+            for tid in past_ids:
+                f = self.fisher[tid].get(n)
+                ts = self.theta_star[tid].get(n)
+                if f is not None and ts is not None:
+                    terms.append((f, ts))
+            if not terms:
+                continue
 
-        # Fresh SGD optimizer just for this penalty pass — reusing the policy's
-        # Adam was empirically wrong: Adam's running v_t (calibrated to small
-        # PPO grads) overshoots when a much larger penalty gradient lands on
-        # top, and the steps push params AWAY from theta_star instead of toward
-        # it. Plain SGD with a small lr + grad clipping is well-behaved.
-        params = [p for p in policy.parameters() if p.requires_grad]
-        penalty_opt = th.optim.SGD(params, lr=self.penalty_lr)
+            count_this = first_param_hooked
+            first_param_hooked = False
 
-        steps_done = 0
-        for _ in range(self.penalty_steps):
-            penalty_opt.zero_grad()
-            penalty = th.zeros((), device=policy.device)
+            def _make_hook(p_ref: th.Tensor, terms=terms, count=count_this):
+                def _hook(grad: th.Tensor) -> th.Tensor:
+                    if count:
+                        # One designated hook counts backward passes so
+                        # last_penalty_steps_run reflects how many gradient
+                        # steps actually carried the penalty.
+                        self._hook_backward_count += 1
+                    with th.no_grad():
+                        pen = th.zeros_like(grad)
+                        for f, ts in terms:
+                            pen += f * (p_ref - ts)
+                        return grad + self.lam * pen
+                return _hook
+
+            handles.append(p.register_hook(_make_hook(p)))
+        return handles
+
+    def _compute_penalty_value(self, past_ids: list[str]) -> float:
+        """Current value of 0.5*lam*sum(F*(θ-θ*)^2) — diagnostic only."""
+        assert self.model is not None
+        with th.no_grad():
+            penalty = 0.0
             for tid in past_ids:
                 fisher_tid = self.fisher[tid]
                 theta_tid = self.theta_star[tid]
-                for n, p in policy.named_parameters():
-                    if not p.requires_grad:
+                for n, p in self.model.policy.named_parameters():
+                    if not p.requires_grad or n not in fisher_tid:
                         continue
-                    if n not in fisher_tid:
-                        continue
-                    f = fisher_tid[n]
-                    ts = theta_tid[n]
-                    penalty = penalty + (f * (p - ts) ** 2).sum()
-            loss = 0.5 * self.lam * penalty
-            # If lam == 0 the loss is identically 0; backward yields zero
-            # gradients but we still take a step so last_penalty_steps_run
-            # increments (test_lambda_zero_disables_protection relies on this).
-            loss.backward()
-            if self.penalty_grad_clip > 0:
-                th.nn.utils.clip_grad_norm_(params, self.penalty_grad_clip)
-            penalty_opt.step()
-            steps_done += 1
-
-        self.last_penalty_steps_run = steps_done
+                    penalty += float(
+                        (fisher_tid[n] * (p - theta_tid[n]) ** 2).sum().item()
+                    )
+        return 0.5 * self.lam * penalty
 
     def _collect_fisher(
         self, env: gym.Env, n_samples: int
@@ -237,7 +275,7 @@ class EwcCL(BaseCLMethod):
             for n, t in self.theta_star.get(tid, {}).items():
                 payload[f"theta::{tid}::{n}"] = t.detach().cpu().numpy()
         payload["__meta__"] = np.asarray(
-            [self.lam, self.fisher_sample_size, self.penalty_steps], dtype=np.float64
+            [self.lam, self.fisher_sample_size], dtype=np.float64
         )
         np.savez(sidecar, **payload)
 
@@ -254,7 +292,6 @@ class EwcCL(BaseCLMethod):
                 meta = data["__meta__"]
                 inst.lam = float(meta[0])
                 inst.fisher_sample_size = int(meta[1])
-                inst.penalty_steps = int(meta[2])
             tids = (
                 [str(t) for t in data["__task_ids__"]]
                 if "__task_ids__" in data.files

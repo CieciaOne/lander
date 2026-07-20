@@ -41,6 +41,9 @@ from .nav import (
     K_OBSTACLES,
     MAX_STEER_RAD,
     MAX_WHEEL_VEL,
+    N_PREV_ACTION_FEATURES,
+    N_TILT_FEATURES,
+    OBS_SCALE,
     OBSTACLE_FEATURES_PER_SLOT,
     OBSTACLE_SENSE_RANGE,
     REAR_AXLE_Y,
@@ -109,10 +112,10 @@ class MjxReward:
 
     progress_scale: float = 5.0
     goal_bonus: float = 50.0
-    waypoint_bonus: float = 20.0
-    speed_bonus_scale: float = 1.0
+    waypoint_bonus: float = 10.0
+    speed_bonus_scale: float = 0.5
     step_cost: float = 0.01
-    collision_penalty: float = 1.5
+    collision_penalty: float = 0.0
     hit_penalty: float = 5.0
     tipped_penalty: float = 20.0
     stuck_in_collision_penalty: float = 5.0
@@ -298,7 +301,10 @@ class MjxNavEnv:
         # Reset is a vmap over per-env subkey + layout index.
         self._jit_reset_envs = jax.jit(jax.vmap(self._reset_one, in_axes=(None, 0, 0)))
 
-        self.obs_dim = 6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+        self.obs_dim = (
+            6 + 2 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
+            + N_TILT_FEATURES + N_PREV_ACTION_FEATURES
+        )
         self.action_dim = 2
 
         self.state: MjxState | None = None
@@ -502,6 +508,15 @@ class MjxNavEnv:
 
         obstacle_feats = self._obstacle_features(pos_xy, yaw)
 
+        # Body-frame tilt features. Read the base quaternion (w, x, y, z)
+        # and compute the world-up vector in body frame. Mirrors the CPU
+        # env's `_build_obs`.
+        quat = sd[self._adr_quat: self._adr_quat + 4]
+        qw, qx, qy, qz = quat[0], quat[1], quat[2], quat[3]
+        tilt_right = -2.0 * (qx * qz - qw * qy)
+        tilt_fwd = 2.0 * (qy * qz + qw * qx)
+
+        obs_tail = 8 + K_OBSTACLES * OBSTACLE_FEATURES_PER_SLOT
         obs = jp.zeros(self.obs_dim, dtype=jp.float32)
         obs = obs.at[0].set(rel_fwd)
         obs = obs.at[1].set(rel_right)
@@ -511,7 +526,13 @@ class MjxNavEnv:
         obs = obs.at[5].set(angvel_z)
         obs = obs.at[6].set(rel_fwd_next)
         obs = obs.at[7].set(rel_right_next)
-        obs = obs.at[8:].set(obstacle_feats)
+        obs = obs.at[8:obs_tail].set(obstacle_feats)
+        obs = obs.at[obs_tail + 0].set(tilt_fwd)
+        obs = obs.at[obs_tail + 1].set(tilt_right)
+        obs = obs.at[obs_tail + 2].set(state.prev_action[0])
+        obs = obs.at[obs_tail + 3].set(state.prev_action[1])
+        # Fixed normalization — mirrors RoverNavEnv (see nav._build_obs_scale).
+        obs = obs / jp.asarray(OBS_SCALE)
         return obs
 
     # ====================================================================== collision

@@ -46,3 +46,6 @@ assets/rover_chassis.urdf
 # Tensorboard logs from PPO training (if you wire it up).
 runs/
 tb/
+
+# MuJoCo stray log
+MUJOCO_LOG.TXT
