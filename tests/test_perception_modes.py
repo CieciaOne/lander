@@ -77,7 +77,6 @@ def test_slam_mode_discovers_obstacles_online():
     env = RoverNavEnv(terrain=_slalom_terrain(), use_lidar=True, control_mode="vw",
                       progress_reward_mode="geodesic", obstacle_obs_mode="none",
                       geo_heading_obs=True, geo_heading_source="slam")
-    n_before = int((env._occ_map.occ > 1.0).sum())
     obs, _ = env.reset(seed=8100)
     # occupancy map exists and the route field is built AT RESET (from the first
     # lidar scan) so geo_heading is active from step 0.
