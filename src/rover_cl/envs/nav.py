@@ -739,8 +739,11 @@ class RoverNavEnv(gym.Env):
         # Online occupancy map + its geodesic field (SLAM perception mode).
         self._occ_map: OccupancyMap | None = None
         self._slam_nav_field: NavField | None = None
-        # Rebuild the SLAM geodesic every N steps (Dijkstra is not free).
+        # Rebuild the SLAM geodesic every N steps (Dijkstra is not free) — and
+        # only when the occupancy or target actually changed (see step()).
         self._slam_rebuild_every = 10
+        self._slam_last_occ = -1
+        self._slam_last_target: tuple[float, float] | None = None
         self.geo_lookahead_cells = int(geo_lookahead_cells)
         self._n_geo_heading = 0
         self.use_lidar = bool(use_lidar)
@@ -1347,6 +1350,8 @@ class RoverNavEnv(gym.Env):
         else:
             self._occ_map = None
             self._slam_nav_field = None
+        self._slam_last_occ = -1
+        self._slam_last_target = None
         # Every-step closest-approach record for "best"/"geodesic" progress
         # shaping (see step()); distinct from the 0.5 m-quantised
         # _best_d_target above. Seeded with the shaping distance (geodesic
@@ -1609,8 +1614,19 @@ class RoverNavEnv(gym.Env):
             _, yaw_now2 = self._base_pose_xy()
             self._occ_map.update(float(pos_xy[0]), float(pos_xy[1]),
                                  self._lidar_endpoints(pos_xy, yaw_now2))
+            # Rebuild the discovered-map geodesic ONLY when it can have changed —
+            # new occupied cells discovered, or the target moved. The Dijkstra is
+            # a pure-Python heapq over the whole grid (~expensive), so on obstacle-
+            # free phases (occupancy stays empty) or once the map has stabilised
+            # this rebuilds rarely instead of every N steps (was an ~8x slowdown).
             if self._step_count % self._slam_rebuild_every == 0:
-                self._rebuild_slam_nav_field(self._current_target())
+                occ_count = int((self._occ_map.occ > 1.0).sum())
+                tgt = (round(float(self._targets[self._wp_idx][0]), 2),
+                       round(float(self._targets[self._wp_idx][1]), 2))
+                if occ_count != self._slam_last_occ or tgt != self._slam_last_target:
+                    self._rebuild_slam_nav_field(self._current_target())
+                    self._slam_last_occ = occ_count
+                    self._slam_last_target = tgt
         obs = self._build_obs()
 
         # Proximity penalty: encourages steering away from obstacles before
