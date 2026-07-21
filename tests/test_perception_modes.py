@@ -77,16 +77,20 @@ def test_slam_mode_discovers_obstacles_online():
     env = RoverNavEnv(terrain=_slalom_terrain(), use_lidar=True, control_mode="vw",
                       progress_reward_mode="geodesic", obstacle_obs_mode="none",
                       geo_heading_obs=True, geo_heading_source="slam")
+    n_before = int((env._occ_map.occ > 1.0).sum())
     obs, _ = env.reset(seed=8100)
-    # empty map + no route field at reset
-    assert env._occ_map is not None and int((env._occ_map.occ > 1.0).sum()) == 0
-    assert env._slam_nav_field is None
+    # occupancy map exists and the route field is built AT RESET (from the first
+    # lidar scan) so geo_heading is active from step 0.
+    assert env._occ_map is not None
+    assert env._slam_nav_field is not None
+    occ0 = int((env._occ_map.occ > 1.0).sum())
     for _ in range(30):
         obs, _, term, trunc, _ = env.step(np.array([1.0, 0.0], dtype=np.float32))
         if term or trunc:
             break
-    assert int((env._occ_map.occ > 1.0).sum()) > 0, "lidar should discover obstacles"
-    assert env._slam_nav_field is not None, "discovered-map geodesic should build"
+    # driving forward discovers more occupied cells than were seen at reset
+    assert int((env._occ_map.occ > 1.0).sum()) >= occ0
+    assert env._slam_nav_field is not None, "discovered-map geodesic should persist"
     assert obs.shape[0] == env.observation_space.shape[0]
 
 

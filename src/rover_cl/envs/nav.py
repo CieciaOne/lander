@@ -1342,16 +1342,23 @@ class RoverNavEnv(gym.Env):
         # SLAM perception: start each episode with an EMPTY occupancy map (the
         # rover has sensed nothing yet) and no route field — it fills in and the
         # geodesic bends as lidar discovers obstacles.
+        self._slam_last_occ = -1
+        self._slam_last_target = None
         if self.geo_heading_obs and self.geo_heading_source == "slam":
             self._occ_map = OccupancyMap(
                 half_extent=float(self.terrain.arena_half_extent),
                 res=self.nav_field_res)
-            self._slam_nav_field = None
+            # Fold in the first lidar scan and build the field NOW, so
+            # geo_heading is active from step 0 (no mid-episode on/off switch,
+            # which destabilised from-scratch training). On an empty/near-empty
+            # map this is just the straight bearing, matching truth mode.
+            self._occ_map.update(
+                float(pos_xy[0]), float(pos_xy[1]),
+                self._lidar_endpoints(pos_xy, self._base_pose_xy()[1]))
+            self._rebuild_slam_nav_field(target)
         else:
             self._occ_map = None
             self._slam_nav_field = None
-        self._slam_last_occ = -1
-        self._slam_last_target = None
         # Every-step closest-approach record for "best"/"geodesic" progress
         # shaping (see step()); distinct from the 0.5 m-quantised
         # _best_d_target above. Seeded with the shaping distance (geodesic
