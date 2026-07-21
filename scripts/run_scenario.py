@@ -62,9 +62,14 @@ def _scenario_label(mission: Mission) -> str:
 
 
 def run_mission(mission: Mission, results_dir: Path, n_envs: int = 1,
-                backend: str = "cpu", mjx_impl: str = "jax") -> Path:
+                backend: str = "cpu", mjx_impl: str = "jax",
+                perception: str | None = None) -> Path:
     scenario_label = _scenario_label(mission)
-    out_dir = results_dir / scenario_label / mission.cl_method / f"seed_{mission.seed}"
+    # Fold the perception mode into the method label so each (CL method ×
+    # perception) combo lands in its own dir and shows as its own --compare row.
+    method_label = (f"{mission.cl_method}__{perception}" if perception
+                    else mission.cl_method)
+    out_dir = results_dir / scenario_label / method_label / f"seed_{mission.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     runner = Runner(
         mission, results_dir=out_dir, verbose=True, n_envs=n_envs,
@@ -108,9 +113,11 @@ def _parse_seeds(spec: str) -> list[int]:
 
 def _build_missions_from_cli(
     scenario: str, cl_method: str, train_steps: int, seeds: list[int],
+    perception: str | None = None,
 ) -> list[Mission]:
     return [
-        get_scenario(scenario, cl_method=cl_method, train_timesteps=train_steps, seed=s)
+        get_scenario(scenario, cl_method=cl_method, train_timesteps=train_steps,
+                     seed=s, perception=perception)
         for s in seeds
     ]
 
@@ -142,7 +149,8 @@ def _print_aggregated_summary(
 
 
 def run_missions(missions: list[Mission], results_dir: Path, n_envs: int = 1,
-                 backend: str = "cpu", mjx_impl: str = "jax") -> None:
+                 backend: str = "cpu", mjx_impl: str = "jax",
+                 perception: str | None = None) -> None:
     """Train each mission and print an aggregated mean +/- std summary."""
     if not missions:
         raise SystemExit("run_missions: no missions to run")
@@ -150,10 +158,12 @@ def run_missions(missions: list[Mission], results_dir: Path, n_envs: int = 1,
     # All missions in one invocation share a scenario + cl_method (we never
     # build mixed batches here), so we can group them under one label.
     for m in missions:
-        run_mission(m, results_dir, n_envs=n_envs, backend=backend, mjx_impl=mjx_impl)
+        run_mission(m, results_dir, n_envs=n_envs, backend=backend,
+                    mjx_impl=mjx_impl, perception=perception)
 
     scenario_label = _scenario_label(missions[0])
-    method = missions[0].cl_method
+    method = (f"{missions[0].cl_method}__{perception}" if perception
+              else missions[0].cl_method)
     method_dir = results_dir / scenario_label / method
     seed_results = collect_seed_results(method_dir)
     _print_aggregated_summary(
@@ -294,7 +304,15 @@ def main() -> None:
                          "supported hardware. Ignored when --backend=cpu.")
     ap.add_argument("--compare", action="store_true",
                     help="Aggregate all CL methods + seeds for this scenario "
-                         "into one plot (comparison.png) and one summary.csv.")
+                         "into one plot (comparison.png) and one summary.csv. "
+                         "Perception modes appear as separate <method>__<mode> rows.")
+    ap.add_argument("--perception", default=None,
+                    choices=["privileged", "reactive", "slam"],
+                    help="Observation-realism mode (orthogonal to --cl-method): "
+                         "privileged = ground-truth obstacle AABBs; reactive = "
+                         "lidar only; slam = obstacles discovered online + "
+                         "geo_heading on the discovered map. Results land under "
+                         "<scenario>/<method>__<mode>/ for a CL×perception grid.")
     args = ap.parse_args()
 
     if args.compare:
@@ -315,9 +333,11 @@ def main() -> None:
     seeds = args.seeds if args.seeds is not None else [args.seed]
     missions = _build_missions_from_cli(
         args.scenario, args.cl_method, args.train_steps, seeds,
+        perception=args.perception,
     )
     run_missions(missions, args.results_dir, n_envs=args.n_envs,
-                 backend=args.backend, mjx_impl=args.mjx_impl)
+                 backend=args.backend, mjx_impl=args.mjx_impl,
+                 perception=args.perception)
 
 
 if __name__ == "__main__":

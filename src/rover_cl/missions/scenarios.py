@@ -36,7 +36,49 @@ def _env_factory(terrain_name: str, max_steps: int = 500,
     ekw = dict(env_kwargs or {})
     def _make(seed: int):
         return RoverNavEnv(terrain=terrain_name, max_steps=max_steps, seed=seed, **ekw)
+    # Stash the build inputs so a post-processor (e.g. apply_perception) can
+    # rebuild the factory with merged env_kwargs without the scenario knowing.
+    _make._terrain_name = terrain_name
+    _make._max_steps = max_steps
+    _make._env_kwargs = ekw
     return _make
+
+
+# PERCEPTION MODE axis (orthogonal to the CL method) — env_kwargs overrides that
+# turn any obstacle scenario into a given observation-realism setting, so the
+# thesis can compare (CL method × perception mode). See RoverNavEnv docs.
+PERCEPTION_ENV_KWARGS: dict[str, dict] = {
+    # ground-truth obstacle AABBs in the obs (teacher-level; the default).
+    "privileged": dict(obstacle_obs_mode="privileged"),
+    # honest mapless: no ground-truth obstacle info, lidar only.
+    "reactive": dict(obstacle_obs_mode="none", use_lidar=True,
+                     geo_heading_obs=False),
+    # discover-and-plan: obstacles sensed into an occupancy map online, and the
+    # geo_heading route hint is planned on that DISCOVERED map (needs geodesic
+    # reward so the truth field also exists for shaping).
+    "slam": dict(obstacle_obs_mode="none", use_lidar=True, geo_heading_obs=True,
+                 geo_heading_source="slam", progress_reward_mode="geodesic"),
+}
+
+
+def apply_perception(mission: "Mission", perception: str | None) -> "Mission":
+    """Rebuild every task's env factory with the perception override merged on
+    top of the scenario's own env_kwargs. No-op when perception is None."""
+    if perception is None:
+        return mission
+    if perception not in PERCEPTION_ENV_KWARGS:
+        raise KeyError(f"Unknown perception {perception!r}. "
+                       f"Known: {sorted(PERCEPTION_ENV_KWARGS)}")
+    override = PERCEPTION_ENV_KWARGS[perception]
+    for task in mission.tasks:
+        fn = task.env_factory
+        if not hasattr(fn, "_env_kwargs"):
+            # factory not built by _env_factory (custom) — can't safely rebuild
+            continue
+        base_ekw = dict(fn._env_kwargs)
+        base_ekw.update(override)
+        task.env_factory = _env_factory(fn._terrain_name, fn._max_steps, base_ekw)
+    return mission
 
 
 def _make_task(
@@ -757,10 +799,13 @@ SCENARIO_REGISTRY = {
 }
 
 
-def get_scenario(name: str, **kwargs) -> Mission:
+def get_scenario(name: str, perception: str | None = None, **kwargs) -> Mission:
     if name not in SCENARIO_REGISTRY:
         raise KeyError(f"Unknown scenario {name!r}. Known: {sorted(SCENARIO_REGISTRY)}")
     mission = SCENARIO_REGISTRY[name](**kwargs)
+    # PERCEPTION MODE axis: rebuild task env factories with the override so any
+    # scenario can be run under privileged / reactive / slam perception.
+    mission = apply_perception(mission, perception)
     # Canonicalize the mission name to "{registry_key}_{cl_method}" so paths
     # under results/<scenario>/<method>/seed_<N>/ always match the name the user
     # passes to --compare. Without this, factories that built shorter labels
