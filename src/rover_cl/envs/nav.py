@@ -54,17 +54,25 @@ class NavField:
 
     def __init__(self, half_extent: float, res: float,
                  obstacles_xywh: list[tuple[float, float, float, float]],
-                 target_xy: tuple[float, float], inflate: float):
+                 target_xy: tuple[float, float], inflate: float,
+                 blocked: np.ndarray | None = None):
         self.half = float(half_extent)
         self.res = float(res)
         self.n = max(4, int(np.ceil(2 * self.half / self.res)))
-        blocked = np.zeros((self.n, self.n), dtype=bool)
-        for (cx, cy, sx, sy) in obstacles_xywh:
-            x0 = cx - sx - inflate; x1 = cx + sx + inflate
-            y0 = cy - sy - inflate; y1 = cy + sy + inflate
-            i0, i1 = self._idx(x0), self._idx(x1)
-            j0, j1 = self._idx(y0), self._idx(y1)
-            blocked[i0:i1 + 1, j0:j1 + 1] = True
+        if blocked is not None:
+            # Caller supplies a ready blocked grid (e.g. from a discovered
+            # occupancy map). Must already be footprint-inflated and shaped
+            # (n, n). Used by the SLAM perception mode so the geodesic is
+            # computed on what the rover has SENSED, not on ground truth.
+            blocked = np.asarray(blocked, dtype=bool)
+        else:
+            blocked = np.zeros((self.n, self.n), dtype=bool)
+            for (cx, cy, sx, sy) in obstacles_xywh:
+                x0 = cx - sx - inflate; x1 = cx + sx + inflate
+                y0 = cy - sy - inflate; y1 = cy + sy + inflate
+                i0, i1 = self._idx(x0), self._idx(x1)
+                j0, j1 = self._idx(y0), self._idx(y1)
+                blocked[i0:i1 + 1, j0:j1 + 1] = True
         # Dijkstra from the target cell. Force the target cell free so there is
         # always a source even if the goal sits just inside an inflated AABB.
         ti, tj = self._idx(target_xy[0]), self._idx(target_xy[1])
@@ -179,6 +187,70 @@ class NavField:
         vx, vy = float(i - i0), float(j - j0)
         norm = (vx * vx + vy * vy) ** 0.5
         return (vx / norm, vy / norm)
+
+
+class OccupancyMap:
+    """Online occupancy grid the rover builds from its forward lidar as it
+    drives — the "M" of SLAM with pose taken from sim odometry (not full SLAM:
+    no loop closure). Cells accumulate log-evidence: each lidar ray adds FREE
+    evidence to the cells it passes through and OCCUPIED evidence to the cell it
+    hits. `blocked()` returns the footprint-inflated occupied grid, which the
+    SLAM perception mode feeds to a NavField so geo_heading is planned on what
+    the rover has actually SENSED, not on ground truth. Starts empty, so early
+    in an episode geo_heading ≈ the straight bearing and bends as obstacles are
+    discovered."""
+
+    def __init__(self, half_extent: float, res: float):
+        self.half = float(half_extent)
+        self.res = float(res)
+        self.n = max(4, int(np.ceil(2 * self.half / self.res)))
+        self.occ = np.zeros((self.n, self.n), dtype=np.float32)
+
+    def _idx(self, w: float) -> int:
+        return int(np.clip((w + self.half) / self.res, 0, self.n - 1))
+
+    @staticmethod
+    def _line(i0, j0, i1, j1):
+        """Integer Bresenham cells from (i0,j0) to (i1,j1), inclusive."""
+        cells = []
+        di, dj = abs(i1 - i0), abs(j1 - j0)
+        si = 1 if i0 < i1 else -1
+        sj = 1 if j0 < j1 else -1
+        err = di - dj
+        i, j = i0, j0
+        while True:
+            cells.append((i, j))
+            if i == i1 and j == j1:
+                break
+            e2 = 2 * err
+            if e2 > -dj:
+                err -= dj; i += si
+            if e2 < di:
+                err += di; j += sj
+        return cells
+
+    def update(self, ox, oy, endpoints):
+        """endpoints: list of (hx, hy, is_hit) world ray endpoints."""
+        i0, j0 = self._idx(ox), self._idx(oy)
+        for (hx, hy, is_hit) in endpoints:
+            cells = self._line(i0, j0, self._idx(hx), self._idx(hy))
+            for (i, j) in cells[:-1]:
+                self.occ[i, j] -= 0.4                     # free evidence
+            i, j = cells[-1]
+            self.occ[i, j] += (2.0 if is_hit else -0.4)   # occupied / free
+        np.clip(self.occ, -5.0, 10.0, out=self.occ)
+
+    def blocked(self, inflate_cells: int) -> np.ndarray:
+        """Footprint-inflated occupied grid (8-connected square dilation)."""
+        b = self.occ > 1.0
+        for _ in range(max(0, int(inflate_cells))):
+            nb = b.copy()
+            nb[:-1, :] |= b[1:, :]; nb[1:, :] |= b[:-1, :]
+            nb[:, :-1] |= b[:, 1:]; nb[:, 1:] |= b[:, :-1]
+            nb[:-1, :-1] |= b[1:, 1:]; nb[1:, 1:] |= b[:-1, :-1]
+            nb[:-1, 1:] |= b[1:, :-1]; nb[1:, :-1] |= b[:-1, 1:]
+            b = nb
+        return b
 
 
 # Obstacle observation — for each of the K nearest box obstacles, the policy
@@ -490,6 +562,27 @@ class RoverNavEnv(gym.Env):
         # has). Requires progress_reward_mode="geodesic" (the field is built
         # only then); falls back to the straight-line bearing otherwise.
         geo_heading_obs: bool = False,
+        # Perception realism (PERCEPTION MODE axis):
+        #   "privileged" — the policy sees ground-truth obstacle AABBs (the 8
+        #                  nearest, footprint-inflated). Default; a teacher-level
+        #                  observation.
+        #   "none"       — the obstacle-feature block is filled with the empty
+        #                  "open terrain" sentinel regardless of the real layout,
+        #                  so the policy gets NO ground-truth obstacle info and
+        #                  must rely on the lidar scan (+ optional SLAM-derived
+        #                  geo_heading). This is the honest mapless / discover-it-
+        #                  yourself setting. Obs dimension is unchanged so a mode
+        #                  is a drop-in swap. The true min-obstacle distance is
+        #                  still computed for the (training-time) proximity reward.
+        obstacle_obs_mode: str = "privileged",
+        # Source of the geo_heading bent bearing (only when geo_heading_obs):
+        #   "truth" — geodesic on the ground-truth obstacle map (self._nav_field).
+        #             Privileged; the original behaviour.
+        #   "slam"  — geodesic on the DISCOVERED occupancy map the rover builds
+        #             online from lidar. Honest: the route hint uses only what
+        #             has been sensed. This is the perception mode paired with
+        #             obstacle_obs_mode="none" for a realistic map-and-plan agent.
+        geo_heading_source: str = "truth",
         # Pure-pursuit lookahead for the bent bearing: 0 = local gradient
         # (bends late, gets clipped); >0 = point the bearing this many grid
         # cells ahead along the geodesic so the rover turns EARLY around
@@ -633,6 +726,21 @@ class RoverNavEnv(gym.Env):
         self.clearance_speed_penalty_scale = float(clearance_speed_penalty_scale)
         self.clearance_safe_dist = float(clearance_safe_dist)
         self.geo_heading_obs = bool(geo_heading_obs)
+        self.obstacle_obs_mode = str(obstacle_obs_mode)
+        if self.obstacle_obs_mode not in ("privileged", "none"):
+            raise ValueError(
+                f"obstacle_obs_mode must be 'privileged' or 'none', "
+                f"got {obstacle_obs_mode!r}")
+        self.geo_heading_source = str(geo_heading_source)
+        if self.geo_heading_source not in ("truth", "slam"):
+            raise ValueError(
+                f"geo_heading_source must be 'truth' or 'slam', "
+                f"got {geo_heading_source!r}")
+        # Online occupancy map + its geodesic field (SLAM perception mode).
+        self._occ_map: OccupancyMap | None = None
+        self._slam_nav_field: NavField | None = None
+        # Rebuild the SLAM geodesic every N steps (Dijkstra is not free).
+        self._slam_rebuild_every = 10
         self.geo_lookahead_cells = int(geo_lookahead_cells)
         self._n_geo_heading = 0
         self.use_lidar = bool(use_lidar)
@@ -776,10 +884,16 @@ class RoverNavEnv(gym.Env):
             OBSTACLE_SENSE_RANGE, OBSTACLE_SENSE_RANGE + 0.1,
             OBSTACLE_SENSE_RANGE, OBSTACLE_SENSE_RANGE + 0.1,
         )
+        min_dist = items[0][0] if items else float("inf")
+        # PERCEPTION MODE: in "none" the policy gets NO ground-truth obstacle
+        # info — leave `out` at the all-empty sentinel (reads as open terrain).
+        # `min_dist` is still the true nearest distance, used only by the
+        # training-time proximity reward, not observed by the policy.
+        if self.obstacle_obs_mode == "none":
+            return out.ravel(), min_dist
         for i in range(min(len(items), K_OBSTACLES)):
             _, fmin, fmax, rmin, rmax = items[i]
             out[i] = (fmin, fmax, rmin, rmax)
-        min_dist = items[0][0] if items else float("inf")
         return out.ravel(), min_dist
 
     def _current_target(self) -> np.ndarray:
@@ -811,6 +925,45 @@ class RoverNavEnv(gym.Env):
             else:
                 out[k] = min(float(dist), self.lidar_max_range) / self.lidar_max_range
         return out
+
+    def _lidar_endpoints(self, pos_xy: np.ndarray, yaw: float):
+        """Cast the same forward fan and return per-ray world endpoints as
+        (hx, hy, is_hit) for occupancy mapping. is_hit=True when a ray struck an
+        obstacle within range (endpoint = the hit); False when it reached max
+        range clear (endpoint = the range limit, all cells free)."""
+        s, c = np.sin(yaw), np.cos(yaw)
+        base_z = float(self._sensor(self._base_pos_id, 3)[2])
+        origin = np.array([float(pos_xy[0]), float(pos_xy[1]),
+                           base_z - LIDAR_HEIGHT_OFFSET], dtype=np.float64)
+        gid = np.array([-1], dtype=np.int32)
+        eps = []
+        for a in self._lidar_angles:
+            ca, sa = np.cos(a), np.sin(a)
+            fx, fy = -s, c
+            rx, ry = c, s
+            dx, dy = fx * ca + rx * sa, fy * ca + ry * sa
+            dvec = np.array([dx, dy, 0.0], dtype=np.float64)
+            dist = mujoco.mj_ray(self._model, self._data, origin, dvec,
+                                 self._lidar_group_mask, 1, -1, gid)
+            is_hit = 0.0 <= dist <= self.lidar_max_range
+            r = float(dist) if is_hit else self.lidar_max_range
+            eps.append((float(pos_xy[0]) + dx * r, float(pos_xy[1]) + dy * r, is_hit))
+        return eps
+
+    def _rebuild_slam_nav_field(self, target_xy) -> None:
+        """Rebuild the geodesic field on the DISCOVERED occupancy map (SLAM
+        perception mode). Blocked cells come from what lidar has sensed so far,
+        footprint-inflated; the target cell is forced free."""
+        if self._occ_map is None:
+            self._slam_nav_field = None
+            return
+        inflate_cells = int(np.ceil(self.nav_field_inflate / self.nav_field_res))
+        blocked = self._occ_map.blocked(inflate_cells)
+        self._slam_nav_field = NavField(
+            half_extent=float(self.terrain.arena_half_extent),
+            res=self.nav_field_res, obstacles_xywh=[],
+            target_xy=(float(target_xy[0]), float(target_xy[1])),
+            inflate=self.nav_field_inflate, blocked=blocked)
 
     def _rebuild_nav_field(self, target_xy) -> None:
         """(Re)build the obstacle-aware NavField for the given target, reading
@@ -864,12 +1017,17 @@ class RoverNavEnv(gym.Env):
         # the geodesic heading equals the straight-line bearing, so this is a
         # no-op there (locomotion / obstacle-free tasks unchanged); it only
         # rotates the bearing when an obstacle actually routes the path.
-        if self.geo_heading_obs and self._nav_field is not None:
+        # SLAM mode routes on the discovered occupancy map; "truth" on the
+        # ground-truth field. Either way `field` is the geodesic used to bend
+        # the bearing.
+        field = (self._slam_nav_field if self.geo_heading_source == "slam"
+                 else self._nav_field)
+        if self.geo_heading_obs and field is not None:
             if self.geo_lookahead_cells > 0:
-                gh = self._nav_field.lookahead_heading(
+                gh = field.lookahead_heading(
                     float(pos_xy[0]), float(pos_xy[1]), self.geo_lookahead_cells)
             else:
-                gh = self._nav_field.heading(float(pos_xy[0]), float(pos_xy[1]))
+                gh = field.heading(float(pos_xy[0]), float(pos_xy[1]))
             if gh is not None:
                 wx, wy = gh
                 gfwd = -s * wx + c * wy
@@ -1173,6 +1331,17 @@ class RoverNavEnv(gym.Env):
         # waypoint advance.
         if self.progress_reward_mode == "geodesic":
             self._rebuild_nav_field(target)
+        # SLAM perception: start each episode with an EMPTY occupancy map (the
+        # rover has sensed nothing yet) and no route field — it fills in and the
+        # geodesic bends as lidar discovers obstacles.
+        if self.geo_heading_obs and self.geo_heading_source == "slam":
+            self._occ_map = OccupancyMap(
+                half_extent=float(self.terrain.arena_half_extent),
+                res=self.nav_field_res)
+            self._slam_nav_field = None
+        else:
+            self._occ_map = None
+            self._slam_nav_field = None
         # Every-step closest-approach record for "best"/"geodesic" progress
         # shaping (see step()); distinct from the 0.5 m-quantised
         # _best_d_target above. Seeded with the shaping distance (geodesic
@@ -1426,6 +1595,15 @@ class RoverNavEnv(gym.Env):
         # the old _prev_action, so the order is consistent: jerk uses
         # (a_now - a_prev), obs publishes a_now.
         self._prev_action = action.copy()
+        # SLAM perception: fold this step's lidar into the occupancy map and
+        # periodically rebuild the discovered-map geodesic that geo_heading
+        # reads (done before _build_obs so the obs reflects the latest map).
+        if self._occ_map is not None:
+            _, yaw_now2 = self._base_pose_xy()
+            self._occ_map.update(float(pos_xy[0]), float(pos_xy[1]),
+                                 self._lidar_endpoints(pos_xy, yaw_now2))
+            if self._step_count % self._slam_rebuild_every == 0:
+                self._rebuild_slam_nav_field(self._current_target())
         obs = self._build_obs()
 
         # Proximity penalty: encourages steering away from obstacles before
