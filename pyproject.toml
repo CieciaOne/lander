@@ -24,6 +24,9 @@ dev = ["pytest>=8.0.0"]
 # Use `pip install -e ".[mjx]"` on a CUDA-capable Linux box, then add
 # `pip install -U "jax[cuda12]"` to point JAX at the GPU.
 mjx = ["mujoco-mjx>=3.5.0,<4.0.0", "jax>=0.4.30", "flax>=0.8.0"]
+# Recurrent (LSTM) policy for the obstacle-nav experiment
+# (scripts/train_obstacle_recurrent.py). RecurrentPPO lives in sb3-contrib.
+recurrent = ["sb3-contrib>=2.0.0"]
 
 [tool.poetry]
 packages = [{ include = "rover_cl", from = "src" }]
