@@ -289,3 +289,21 @@ Figure: results/scenario_15_obstacle_field/comparison.png.
 **Takeaways:** (1) Giving back the ground-truth-obstacle cheat is costly for a purely reactive agent (0.70 → 0.43). (2) An honest discover-and-plan agent (SLAM occupancy mapping + geo_heading planned on what it has sensed) FULLY recovers it and slightly beats privileged (0.733 vs 0.700) — a realistic perception need not underperform a privileged one. (3) Plausible why SLAM ≥ privileged: geo_heading is a stronger, pre-digested signal ("go this way around") than raw obstacle boxes the policy must plan from itself.
 
 Single-phase, so CL/forgetting is not exercised here (EWC≈PPO on one task) — this is the perception comparison only. Next per the user: confirm this holds (more seeds / a multi-phase obstacle curriculum) before layering the forgetting axis. Infra: `--perception {privileged,reactive,slam}` + `--compare` grid, all committed.
+
+## 2026-07 — scenario_16 full-curriculum grid COMPLETE: EWC × perception, forgetting + skill (N=1)
+
+Complete skill curriculum (locomotion → target-tracking → obstacle-avoidance → combined), one EWC policy per perception mode, 1M steps/phase, seed 0. Retention = avg final-phase success across the 4 skills; forgetting = drop of an earlier skill after later phases.
+
+| perception | avg retention | forgetting (loco/track/avoid/combined) |
+|---|---|---|
+| **slam** | **0.633** | 0.033 (0 / 0 / 0.133 / 0) |
+| privileged | 0.575 | 0.025 (0 / 0 / 0.1 / 0) |
+| reactive | 0.542 | 0.000 (0 / 0 / 0 / 0) |
+
+Figure: results/scenario_16_full_curriculum/comparison.png.
+
+**Findings:** (1) EWC keeps **forgetting near zero** across the whole skill sequence in every perception mode — locomotion and tracking fully survive learning avoidance/combined (the core CL result, now on a task that also tests obstacle avoidance). (2) Perception affects the achievable skill level (retention), and **the honest discover-and-plan agent (slam) matches/beats the privileged one** (0.633 ≥ 0.575), both above pure reactive (0.542) — consistent with the single-task scenario_15 result (slam ≈ privileged ≫ reactive).
+
+**Debug note (slam training collapse, fixed):** slam initially went to 0.00 on the obstacle-free phases (loco/tracking) while the env was proven navigable (reactive policy 10/10 in it). Root cause: on an empty occupancy map the grid geodesic's heading is a QUANTISED (~±10°) version of the straight bearing, and feeding that biased bearing with no obstacle features gave a misleading progress gradient that froze from-scratch training. Fix: in slam mode the bearing is only bent AFTER real obstacles are discovered (the geodesic is a no-op in open space by design); until then it uses the raw straight bearing (= reactive). Committed.
+
+Caveat: N=1 seed; the retention gaps (slam 0.63 vs priv 0.58 vs react 0.54) are modest and need multi-seed to confirm. Forgetting≈0 is the robust headline.
