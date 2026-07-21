@@ -47,6 +47,16 @@ EK = dict(
     proximity_safety_dist=1.8, collision_terminate_steps=1,
 )
 
+# Match the perception config the policy was trained on (a slam policy needs the
+# discovered-map obs; a reactive one must not get ground-truth obstacles).
+PERCEPTION_EK = {
+    "privileged": dict(obstacle_obs_mode="privileged", geo_heading_obs=True,
+                       geo_heading_source="truth"),
+    "reactive": dict(obstacle_obs_mode="none", geo_heading_obs=False),
+    "slam": dict(obstacle_obs_mode="none", geo_heading_obs=True,
+                 geo_heading_source="slam"),
+}
+
 
 def _gap_waypoints(gaps, n_wp):
     if not gaps or n_wp <= 0:
@@ -108,7 +118,15 @@ def main():
     ap.add_argument("--path-lo", type=float, default=9.0)
     ap.add_argument("--path-hi", type=float, default=14.0)
     ap.add_argument("--fast", action="store_true", help="run faster than real time")
+    ap.add_argument("--perception", default=None,
+                    choices=["privileged", "reactive", "slam"],
+                    help="Match the policy's training perception "
+                         "(e.g. slam for an ewc__slam checkpoint).")
     args = ap.parse_args()
+
+    if args.perception:
+        EK.update(PERCEPTION_EK[args.perception])
+        print(f"perception: {args.perception}")
 
     _guard_macos_mjpython()
     seeds = [args.seed] if args.seed is not None else _parse_seeds(args.seeds)

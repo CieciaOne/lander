@@ -51,6 +51,16 @@ EK = dict(
     proximity_safety_dist=1.7, collision_terminate_steps=1,
 )
 
+# Perception overrides so a policy is visualised with the SAME observation it was
+# trained on (a slam policy in a privileged env would see the wrong obs).
+PERCEPTION_EK = {
+    "privileged": dict(obstacle_obs_mode="privileged", geo_heading_obs=True,
+                       geo_heading_source="truth"),
+    "reactive": dict(obstacle_obs_mode="none", geo_heading_obs=False),
+    "slam": dict(obstacle_obs_mode="none", geo_heading_obs=True,
+                 geo_heading_source="slam"),
+}
+
 
 def _gap_waypoints(gaps, n_wp):
     if not gaps or n_wp <= 0:
@@ -184,7 +194,15 @@ def main():
     ap.add_argument("--path-lo", type=float, default=9.0)
     ap.add_argument("--path-hi", type=float, default=14.0)
     ap.add_argument("--out", default="results/_obstacle_nav/slalom_hard_maps.png")
+    ap.add_argument("--perception", default=None,
+                    choices=["privileged", "reactive", "slam"],
+                    help="Visualise the policy with this perception config "
+                         "(must match how it was trained).")
     args = ap.parse_args()
+
+    if args.perception:
+        EK.update(PERCEPTION_EK[args.perception])
+        print(f"perception: {args.perception} -> {PERCEPTION_EK[args.perception]}")
 
     if "-" in args.seeds:
         a, b = args.seeds.split("-"); seeds = list(range(int(a), int(b) + 1))
