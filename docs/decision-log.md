@@ -262,3 +262,14 @@ Implemented scripts/train_obstacle_recurrent.py (RecurrentPPO / MlpLstmPolicy) t
 **Conclusion:** RecurrentPPO from scratch is far more sample-hungry / slower per step than PPO, and on Mac CPU (6 envs) it does not produce a usable policy in a practical budget; iterating its hyperparameters would cost many CPU-hours per attempt. LSTM is a GPU-tier improvement (needs the 10-50× throughput of MJX/CUDA). Shelved for the Mac-only phase. Scripts + the optional `recurrent` extra remain in the repo for when GPU is available.
 
 Cheaper Mac-viable lever that targets the same HARD bottleneck: the env already has an opt-in GEODESIC bent-bearing observation (`geo_heading_obs`), which points the target bearing along the collision-free route instead of straight through obstacles. It was left off to keep the "unknown terrain, lidar-only" premise, but enabling it (reframed as "rover follows a globally-planned route, RL does local control" — realistic for Mars ops) is a fast flip+retrain on the MLP and the likely next step to push HARD past ~0.75.
+
+## 2026-07 — Perception-mode axis (privileged / reactive / SLAM) for CL × perception comparison
+
+Per the "make it realistic — give back the obstacle cheat, discover via SLAM" direction, added a PERCEPTION MODE axis orthogonal to the CL method, so the thesis can compare (CL method × perception):
+- **privileged** (default): ground-truth obstacle AABBs in the obs (teacher-level).
+- **reactive**: `obstacle_obs_mode="none"` — no ground-truth obstacle info; lidar only (honest mapless).
+- **slam**: obstacles discovered online into an `OccupancyMap` (forward-lidar Bresenham ray-marking + footprint dilation, pose from sim odometry — "M" of SLAM, no loop closure); `geo_heading` planned on the DISCOVERED map via `NavField(blocked=...)`, rebuilt every 10 steps. Starts straight, bends as obstacles are sensed.
+
+All modes keep obs dim fixed (drop-in). Env flags: `obstacle_obs_mode`, `geo_heading_source`. Reward's proximity term still uses the true nearest distance (training-time shaping, allowed). `run_scenario.py --perception {privileged,reactive,slam}` applies the override to any scenario's tasks (via `apply_perception` rebuilding the tagged env factories) and writes results under `<scenario>/<method>__<perception>/seed_N`, so `--compare` renders the CL×perception grid. Tests: tests/test_perception_modes.py. Also archived obsolete results (scenario_10 variants, old/, _learnability) to results/archive/. Scenario code left intact (test-coupled; not worth the churn per user).
+
+Note: full SLAM (unknown pose + loop closure) deliberately not implemented — occupancy mapping with sim odometry captures the "discover, don't get told" realism at a fraction of the cost. LSTM remains GPU-tier.
