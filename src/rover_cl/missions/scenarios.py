@@ -54,10 +54,12 @@ PERCEPTION_ENV_KWARGS: dict[str, dict] = {
     "reactive": dict(obstacle_obs_mode="none", use_lidar=True,
                      geo_heading_obs=False),
     # discover-and-plan: obstacles sensed into an occupancy map online, and the
-    # geo_heading route hint is planned on that DISCOVERED map (needs geodesic
-    # reward so the truth field also exists for shaping).
+    # geo_heading route hint is planned on that DISCOVERED map. The occupancy
+    # field is built independently of the reward mode, so we DON'T force the
+    # reward here — every perception mode keeps the scenario's own reward, which
+    # keeps the comparison clean (only the observation differs).
     "slam": dict(obstacle_obs_mode="none", use_lidar=True, geo_heading_obs=True,
-                 geo_heading_source="slam", progress_reward_mode="geodesic"),
+                 geo_heading_source="slam"),
 }
 
 
