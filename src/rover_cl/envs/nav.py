@@ -1025,6 +1025,18 @@ class RoverNavEnv(gym.Env):
         # the bearing.
         field = (self._slam_nav_field if self.geo_heading_source == "slam"
                  else self._nav_field)
+        # In SLAM mode, only BEND the bearing once real obstacles have been
+        # discovered. On an empty/near-empty occupancy map the grid geodesic's
+        # heading is a QUANTISED (≈±10°) version of the straight bearing, not
+        # exactly straight — feeding that biased bearing with no obstacle
+        # features (obstacle_obs_mode="none") gave a misleading progress
+        # gradient that collapsed from-scratch training on obstacle-free phases
+        # (loco/tracking → 0.00). The geodesic is meant to be a no-op in open
+        # space, so fall back to the raw straight bearing until something is
+        # actually sensed.
+        if (self.geo_heading_source == "slam" and self._occ_map is not None
+                and int((self._occ_map.occ > 1.0).sum()) == 0):
+            field = None
         if self.geo_heading_obs and field is not None:
             if self.geo_lookahead_cells > 0:
                 gh = field.lookahead_heading(
