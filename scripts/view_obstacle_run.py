@@ -136,12 +136,40 @@ def main():
     lstm_state = None
     ep_starts = np.ones((1,), dtype=bool)
 
+    def draw_markers(viewer):
+        """Draw goal (green) + waypoints (blue) as viewer overlay spheres at the
+        ACTUAL rolled positions. The env's built-in start/goal SITE markers sit
+        at stale template coords on randomised terrains and there are no waypoint
+        markers at all, so we render our own."""
+        scn = viewer.user_scn
+        scn.ngeom = 0
+
+        def add(pos, size, rgba):
+            if scn.ngeom >= scn.maxgeom:
+                return
+            mujoco.mjv_initGeom(
+                scn.geoms[scn.ngeom], int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                np.array([size, size, size], dtype=float),
+                np.array([pos[0], pos[1], pos[2]], dtype=float),
+                np.eye(3).flatten(), np.array(rgba, dtype=np.float32))
+            scn.ngeom += 1
+
+        gx, gy = env.terrain.goal_pos
+        add((gx, gy, 0.3), 0.5, (0.2, 0.9, 0.2, 0.9))          # goal = green
+        for (wx, wy) in env.terrain.waypoints:
+            add((wx, wy, 0.25), 0.35, (0.3, 0.55, 1.0, 0.9))    # waypoint = blue
+
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.trackbodyid = base_id
-        viewer.cam.distance = 6.0
-        viewer.cam.elevation = -20
+        viewer.cam.distance = 8.0
+        viewer.cam.elevation = -35
         viewer.cam.azimuth = 110
+        # Obstacles live in the private lidar geom group when use_lidar=True; the
+        # viewer hides that group by default. Show all geom groups, and hide the
+        # (stale) built-in site markers to avoid confusion.
+        viewer.opt.geomgroup[:] = 1
+        viewer.opt.sitegroup[:] = 0   # hide the stale built-in start/goal sites
         print(f"\n>>> seed {seeds[0]} — watch the rover weave the slalom. "
               "TAB: cameras, mouse: orbit, ESC: quit.\n")
         steps = 0
@@ -156,6 +184,7 @@ def main():
             obs, _, terminated, truncated, info = env.step(action)
             ep_starts = np.array([terminated or truncated])
             steps += 1
+            draw_markers(viewer)
             viewer.sync()
 
             if terminated or truncated:
