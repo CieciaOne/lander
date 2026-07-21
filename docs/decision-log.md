@@ -244,3 +244,13 @@ Clean 60-eps/tier eval of the fine-tuned policy (results/_obstacle_nav/slalom_fi
 **Real wins:** corner-cutting COLLISIONS eliminated (maps: no collision markers; failures are now timeouts, not crashes; every success collision-free). field/dense/HARD-long improved. Seeds 8103/8104 flipped FAIL→SUCCESS.
 
 **Honesty caution — selection bias:** the mid-training eval showed HARD 0.85-0.88, but that was the MAX over ~26 noisy 40-episode evals on varying seeds (max-of-noisy-estimates overestimates). The unbiased 60-episode eval gives HARD ~68%. Report 68%, not 0.88. HARD (with waypoints) remains the bottleneck: hitting specific in-gap waypoints in order while weaving is genuinely hard for the reactive policy; closing 68%→85% would need more targeted training and larger eval-based selection (or a smarter waypoint/gate representation), not more optimistic checkpoint-picking.
+
+## 2026-07 — Clean-run experiment (Mac CPU): confirmed HARD ceiling ~0.75; no improvement over warm-start
+
+Per the "single clean run + fixed-eval selection" plan (GPU/MJX deferred — Mac only), ran an uninterrupted fine-tune from the best policy: strict collision-terminate=1 throughout, proximity 0.28, clearance-speed penalty, waypoint-prob ramp 0.35→0.6, and checkpoint selection on a FIXED 100-episode eval (unbiased). Result over 2.4M steps:
+- HARD (fixed 100-ep) oscillated 0.69-0.78; field ~0.82-0.86; the only `*saved` was at +150k (HARD 0.75). Later checkpoints never beat it, and loco COLLAPSED to 0.00 at +2.25M (reduced-proximity + waypoint-ramp eroding the open-field skill — the loco-fragility seen before).
+- Definitive 60-ep eval of the clean-run best was slightly WORSE than the prior strict-termination checkpoint (field 80 vs 83, dense 77 vs 95). So the clean run did NOT improve the policy.
+
+**Canonical policy = `results/_obstacle_nav/slalom_field_hard_best.zip`** (the strict-termination fine-tune, field_hard2). Honest numbers (every success collision-free; seed variance shown): loco ~100%, field (3-4 obstacles) ~80-85%, dense (5 obstacles short) ~77-95%, HARD (obstacles + 1-2 waypoints) ~68-75%, HARD-long ~60-62%.
+
+**Conclusion:** on Mac CPU (6 envs) the reactive policy is at its ceiling — field ~0.85, HARD ~0.75. More of the same training doesn't break HARD higher and eventually destabilises locomotion. Realistic paths beyond this (all deferred): GPU/MJX for 10-50× throughput → clean 30-50M run; recurrent policy (LSTM) for multi-waypoint sequencing; explicit gate/lookahead obs. Corner-cutting collisions and wobble are fixed; failures are now conservative timeouts.
