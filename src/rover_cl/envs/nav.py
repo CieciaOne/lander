@@ -1329,7 +1329,12 @@ class RoverNavEnv(gym.Env):
         # in geodesic mode; cheap Dijkstra on the arena grid). Obstacles are
         # static within an episode, so this is rebuilt only here and on each
         # waypoint advance.
-        if self.progress_reward_mode == "geodesic":
+        # Build the ground-truth nav field when the reward needs it (geodesic)
+        # OR when geo_heading reads it (source="truth") — so privileged mode can
+        # use a perfect route hint without forcing a geodesic reward (keeps the
+        # reward identical across perception modes).
+        if (self.progress_reward_mode == "geodesic"
+                or (self.geo_heading_obs and self.geo_heading_source == "truth")):
             self._rebuild_nav_field(target)
         # SLAM perception: start each episode with an EMPTY occupancy map (the
         # rover has sensed nothing yet) and no route field — it fills in and the
@@ -1518,7 +1523,9 @@ class RoverNavEnv(gym.Env):
                 # closest-approach record — otherwise the stale small record
                 # from the just-reached waypoint would suppress all reward
                 # toward the next one.
-                if self.progress_reward_mode == "geodesic":
+                if (self.progress_reward_mode == "geodesic"
+                        or (self.geo_heading_obs
+                            and self.geo_heading_source == "truth")):
                     self._rebuild_nav_field(next_target)
                 self._reward_best_dist = self._target_distance(pos_xy, dist_to_next)
                 waypoint_reached_bonus = self.waypoint_bonus

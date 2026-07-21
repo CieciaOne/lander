@@ -48,8 +48,12 @@ def _env_factory(terrain_name: str, max_steps: int = 500,
 # turn any obstacle scenario into a given observation-realism setting, so the
 # thesis can compare (CL method × perception mode). See RoverNavEnv docs.
 PERCEPTION_ENV_KWARGS: dict[str, dict] = {
-    # ground-truth obstacle AABBs in the obs (teacher-level; the default).
-    "privileged": dict(obstacle_obs_mode="privileged"),
+    # full ground truth: obstacle AABBs AND a geo_heading route hint planned on
+    # the true map — the genuine upper bound. (Paired with slam's discovered
+    # route hint so the comparison is apples-to-apples on ROUTE quality, not on
+    # "who has a route hint at all".)
+    "privileged": dict(obstacle_obs_mode="privileged", use_lidar=True,
+                       geo_heading_obs=True, geo_heading_source="truth"),
     # honest mapless: no ground-truth obstacle info, lidar only.
     "reactive": dict(obstacle_obs_mode="none", use_lidar=True,
                      geo_heading_obs=False),
