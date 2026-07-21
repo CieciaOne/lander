@@ -87,12 +87,41 @@ def _live_obstacles(env):
     return out
 
 
-def _geodesic_path(obstacles, waypoints, start, goal, max_steps=8000, step=0.08,
-                   res=0.1):
-    """Trace a collision-free path start → waypoints → goal by descending the
-    NavField distance-to-target (heading) toward each target in turn. Uses a
-    fine grid so the traced route hugs the true gaps. Returns the path points
-    and whether every leg was reachable."""
+def _grid_descent(nf, start, max_steps=40000):
+    """Extract the geodesic route on a NavField by walking, cell by cell, to the
+    8-neighbour with the smallest distance-to-target. Because blocked (inflated)
+    cells hold +inf they are never chosen, so the whole route stays in free
+    space — no straight-line 'jumps' that cut through obstacles (the bug in the
+    earlier heading-descent tracer). Returns cell-centre world points and whether
+    the target was reached."""
+    i, j = nf._idx(start[0]), nf._idx(start[1])
+    n = nf.n
+    if not np.isfinite(nf.dist[i, j]):
+        return np.empty((0, 2)), False
+    pts = []
+    for _ in range(max_steps):
+        pts.append((i * nf.res - nf.half + nf.res / 2,
+                    j * nf.res - nf.half + nf.res / 2))
+        if nf.dist[i, j] == 0.0:
+            return np.array(pts), True
+        best, bd = None, nf.dist[i, j]
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                ni, nj = i + di, j + dj
+                if 0 <= ni < n and 0 <= nj < n and nf.dist[ni, nj] < bd:
+                    bd = nf.dist[ni, nj]; best = (ni, nj)
+        if best is None:
+            return np.array(pts), False
+        i, j = best
+    return np.array(pts), False
+
+
+def _geodesic_path(obstacles, waypoints, start, goal, res=0.1):
+    """Collision-free route start → waypoints → goal, extracted by grid descent
+    on the NavField distance field for each leg. Returns the path points and
+    whether every leg reached its target."""
     obs_xywh = [(cx, cy, h, h) for (cx, cy, h) in obstacles]
     targets = list(waypoints) + [goal]
     path = [np.array(start, dtype=float)]
@@ -100,18 +129,11 @@ def _geodesic_path(obstacles, waypoints, start, goal, max_steps=8000, step=0.08,
     for tgt in targets:
         nf = NavField(half_extent=15.0, res=res, obstacles_xywh=obs_xywh,
                       target_xy=(float(tgt[0]), float(tgt[1])), inflate=F)
-        if not np.isfinite(nf.distance(float(path[-1][0]), float(path[-1][1]))):
+        seg, reached = _grid_descent(nf, path[-1])
+        if not reached:
             feasible = False
-            break
-        p = path[-1].copy()
-        for _ in range(max_steps):
-            if np.hypot(p[0] - tgt[0], p[1] - tgt[1]) < 0.4:
-                break
-            h = nf.heading(float(p[0]), float(p[1]))
-            if h is None:
-                break
-            p = p + step * np.array(h, dtype=float)
-            path.append(p.copy())
+        if len(seg):
+            path.extend(seg)
         path.append(np.array(tgt, dtype=float))
     return np.array(path), feasible
 
@@ -131,13 +153,22 @@ def _rollout(model, env, seed):
     return bool(info["is_success"]), touched, xs, ys, hit_xy
 
 
-def _min_clearance(path, obstacles):
-    """Smallest distance from any path point to any obstacle BOX edge (0 if
-    inside). >= footprint F ⇒ the path is collision-free for the disc model."""
-    if len(path) == 0:
+def _min_clearance(path, obstacles, dstep=0.03):
+    """Smallest distance from the path to any obstacle BOX edge (0 if inside),
+    sampled DENSELY along every segment — not just at vertices, so a long
+    straight segment that clips an obstacle between its endpoints is caught.
+    >= footprint F ⇒ the route is collision-free for the disc model."""
+    if len(path) < 1 or not obstacles:
         return float("inf")
+    # Densify: interpolate points along each segment.
+    dense = [path[0]]
+    for a, b in zip(path[:-1], path[1:]):
+        d = float(np.hypot(*(np.asarray(b) - np.asarray(a))))
+        k = max(1, int(d / dstep))
+        for t in np.linspace(0, 1, k + 1)[1:]:
+            dense.append(a + t * (np.asarray(b) - np.asarray(a)))
     best = float("inf")
-    for (px, py) in path:
+    for (px, py) in dense:
         for (cx, cy, h) in obstacles:
             dx = max(abs(px - cx) - h, 0.0); dy = max(abs(py - cy) - h, 0.0)
             best = min(best, float(np.hypot(dx, dy)))
