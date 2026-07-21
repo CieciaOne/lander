@@ -273,3 +273,19 @@ Per the "make it realistic — give back the obstacle cheat, discover via SLAM" 
 All modes keep obs dim fixed (drop-in). Env flags: `obstacle_obs_mode`, `geo_heading_source`. Reward's proximity term still uses the true nearest distance (training-time shaping, allowed). `run_scenario.py --perception {privileged,reactive,slam}` applies the override to any scenario's tasks (via `apply_perception` rebuilding the tagged env factories) and writes results under `<scenario>/<method>__<perception>/seed_N`, so `--compare` renders the CL×perception grid. Tests: tests/test_perception_modes.py. Also archived obsolete results (scenario_10 variants, old/, _learnability) to results/archive/. Scenario code left intact (test-coupled; not worth the churn per user).
 
 Note: full SLAM (unknown pose + loop closure) deliberately not implemented — occupancy mapping with sim odometry captures the "discover, don't get told" realism at a fraction of the cost. LSTM remains GPU-tier.
+
+## 2026-07 — First perception-mode result: SLAM ≈ privileged ≫ reactive (EWC, scenario_15, 3M, N=1)
+
+First run of the (CL method × perception) grid — EWC on scenario_15 (single-phase obstacle slalom, 3M steps from scratch, seed 0, success = final-phase avg over 30 eps, strict collision-terminate):
+
+| perception | rover sees | success |
+|---|---|---|
+| slam | discovers obstacles online (occupancy map) + geo_heading on the DISCOVERED map | **0.733** |
+| privileged | ground-truth obstacle AABBs | 0.700 |
+| reactive | lidar + goal only | 0.433 |
+
+Figure: results/scenario_15_obstacle_field/comparison.png.
+
+**Takeaways:** (1) Giving back the ground-truth-obstacle cheat is costly for a purely reactive agent (0.70 → 0.43). (2) An honest discover-and-plan agent (SLAM occupancy mapping + geo_heading planned on what it has sensed) FULLY recovers it and slightly beats privileged (0.733 vs 0.700) — a realistic perception need not underperform a privileged one. (3) Plausible why SLAM ≥ privileged: geo_heading is a stronger, pre-digested signal ("go this way around") than raw obstacle boxes the policy must plan from itself.
+
+Single-phase, so CL/forgetting is not exercised here (EWC≈PPO on one task) — this is the perception comparison only. Next per the user: confirm this holds (more seeds / a multi-phase obstacle curriculum) before layering the forgetting axis. Infra: `--perception {privileged,reactive,slam}` + `--compare` grid, all committed.
