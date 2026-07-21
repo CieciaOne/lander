@@ -757,6 +757,54 @@ def scenario_15_obstacle_field(
     )
 
 
+def scenario_16_full_curriculum(
+    cl_method: str = "naive",
+    train_timesteps: int = 1_000_000,
+    eval_episodes: int = 30,
+    max_steps: int = 2000,
+    seed: int = 0,
+    ewc_lam: float = 1000.0,
+) -> Mission:
+    """Complete skill curriculum for the CL comparison — one policy learns four
+    skills in sequence and we measure how much each new skill erodes the old:
+
+        Phase 0  RC_c_locomotion — drive to a goal (no obstacles, no waypoints)
+        Phase 1  RC_c_tracking   — follow a 1-2 waypoint chain (no obstacles)
+        Phase 2  RC_c_avoidance  — weave a 5-gate slalom (no waypoints)
+        Phase 3  RC_c_combined   — slalom AND in-gap waypoints (everything)
+
+    Every phase shares ONE obstacle-capable env config (lidar + Curiosity vw
+    control), so the obs/action space is constant and the policy carries weights
+    across phases — the prerequisite for measuring forgetting. After each phase
+    the Runner re-evaluates all earlier phases, giving the retention matrix and
+    forgetting metric across the whole skill sequence.
+
+    Orthogonal to the CL method, run under any perception mode via
+    `run_scenario.py --perception {privileged,reactive,slam}`: the obstacle
+    phases (2, 3) exercise it; the obstacle-free phases (0, 1) are unaffected.
+    This yields the full (CL method × perception) grid on a task that tests
+    locomotion, target tracking, obstacle avoidance, AND forgetting together.
+    """
+    ekw = dict(use_lidar=True, control_mode="vw", progress_reward_mode="best",
+               collision_terminate_steps=1, collision_penalty=0.0,
+               hit_penalty=8.0, stuck_in_collision_penalty=25.0,
+               proximity_penalty_scale=0.28, proximity_safety_dist=1.8)
+    phase_terrains = ["RC_c_locomotion", "RC_c_tracking",
+                      "RC_c_avoidance", "RC_c_combined"]
+    tasks = [
+        _make_task(
+            terrain, train_timesteps, eval_episodes, max_steps,
+            ent_coef=0.01, env_kwargs=ekw,
+        )
+        for terrain in phase_terrains
+    ]
+    cl_kwargs = {"lam": ewc_lam} if cl_method in ("ewc", "hybrid") else {}
+    return Mission(
+        name=f"scenario_16_full_curriculum_{cl_method}",
+        tasks=tasks, cl_method=cl_method, cl_kwargs=cl_kwargs, seed=seed,
+    )
+
+
 def scenario_02_threat_classes(**_kwargs) -> Mission:
     """Scenario 2 (threat classification track) — NOT YET IMPLEMENTED.
 
@@ -799,6 +847,7 @@ SCENARIO_REGISTRY = {
     "scenario_13_integrated_curriculum": scenario_13_integrated_curriculum,
     "scenario_14_skill_sequence": scenario_14_skill_sequence,
     "scenario_15_obstacle_field": scenario_15_obstacle_field,
+    "scenario_16_full_curriculum": scenario_16_full_curriculum,
     # Stubs (raise NotImplementedError on call but registered so they're discoverable):
     "scenario_02_threat_classes": scenario_02_threat_classes,
     "scenario_06_fusion": scenario_06_fusion,

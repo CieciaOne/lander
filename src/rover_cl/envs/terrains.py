@@ -1770,6 +1770,64 @@ def terrain_RC_field(seed: int = 0) -> TerrainSpec:
     return spec
 
 
+def _curriculum_terrain(name: str, n_obstacles: int, waypoints: str):
+    """Shared factory for the scenario_16 skill curriculum. All phases share one
+    env config (obstacle-capable: lidar + vw) so the CL policy carries weights
+    across them; only the TERRAIN skill changes. `waypoints`: "none" | "free"
+    (independent along-path targets, obstacle-free tracking) | "gap" (in the
+    clear slalom gaps, so they're always reachable amid obstacles)."""
+    spec = _flat_template(name, max_obstacles=8,
+                          ground_rgba=(0.55, 0.45, 0.35, 1.0))
+
+    def _roll(rng: np.random.Generator) -> TerrainRoll:
+        start, yaw, goal = sample_start_goal_pair(
+            rng, arena_half=12.0, min_separation=6.0, max_separation=14.0,
+            margin=2.0, relative_bearing="front")
+        pos, sz, gaps = sample_obstacles_slalom(
+            rng, start, goal, n_obstacles, max_slots=8, size_range=(0.4, 0.6),
+            return_gaps=True)
+        if waypoints == "free":
+            n_wp = int(rng.integers(1, 3))
+            wps = sample_waypoints_between(rng, start, goal, n_waypoints=n_wp,
+                                           lateral_jitter=1.2)
+        elif waypoints == "gap" and gaps:
+            n_wp = int(rng.integers(1, 3))
+            idx = np.linspace(0, len(gaps) - 1,
+                              min(n_wp, len(gaps))).round().astype(int)
+            wps = tuple(gaps[i] for i in sorted(set(int(k) for k in idx)))
+        else:
+            wps = ()
+        return TerrainRoll(start_pos=start, start_yaw=yaw, goal_pos=goal,
+                           waypoints=wps, obstacle_positions=pos,
+                           obstacle_sizes=sz)
+    spec.randomize_on_reset = _roll
+    return spec
+
+
+def terrain_RC_c_locomotion(seed: int = 0) -> TerrainSpec:
+    """Curriculum phase 0 — pure locomotion: drive to a goal, no obstacles, no
+    waypoints. Uses the obstacle-capable env config so obs/action match later
+    phases (CL weight carry-over)."""
+    return _curriculum_terrain("RC_c_locomotion", n_obstacles=0, waypoints="none")
+
+
+def terrain_RC_c_tracking(seed: int = 0) -> TerrainSpec:
+    """Curriculum phase 1 — target tracking: hit a chain of 1-2 waypoints, no
+    obstacles."""
+    return _curriculum_terrain("RC_c_tracking", n_obstacles=0, waypoints="free")
+
+
+def terrain_RC_c_avoidance(seed: int = 0) -> TerrainSpec:
+    """Curriculum phase 2 — obstacle avoidance: weave a 5-gate slalom, no
+    waypoints."""
+    return _curriculum_terrain("RC_c_avoidance", n_obstacles=5, waypoints="none")
+
+
+def terrain_RC_c_combined(seed: int = 0) -> TerrainSpec:
+    """Curriculum phase 3 — everything: 5-gate slalom AND 1-2 in-gap waypoints."""
+    return _curriculum_terrain("RC_c_combined", n_obstacles=5, waypoints="gap")
+
+
 def terrain_RC_joint_mixture(seed: int = 0) -> TerrainSpec:
     """Joint-training baseline terrain: uniformly samples per episode from
     the four sub-distributions visited sequentially by scenario_13's
@@ -2014,6 +2072,10 @@ TERRAIN_CATALOG: dict[str, TerrainFactory] = {
     "RC_navigation_terrain":  terrain_RC_navigation_terrain,
     "RC_joint_mixture":       terrain_RC_joint_mixture,
     "RC_field":               terrain_RC_field,
+    "RC_c_locomotion":        terrain_RC_c_locomotion,
+    "RC_c_tracking":          terrain_RC_c_tracking,
+    "RC_c_avoidance":         terrain_RC_c_avoidance,
+    "RC_c_combined":          terrain_RC_c_combined,
 }
 
 
