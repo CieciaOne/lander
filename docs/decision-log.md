@@ -319,3 +319,11 @@ Re-ran the EWC × perception curriculum with the anti-wobble angvel penalty (sca
 | privileged | 0.417 | 0.192 | (0.575 / 0.025) |
 
 **Takeaways:** (1) The smoothness penalty does NOT systematically hurt CL — reactive (forgetting 0.000) and slam (0.008) kept forgetting near-zero WITH it, and reactive retention even improved (0.542→0.583). So smooth driving and retention coexist. (2) privileged is an OUTLIER: retention 0.575→0.417, forgetting 0.025→0.192 (loco −0.4). Given reactive/slam were fine, this is most likely a single-seed instability (geo_heading-truth + angvel + from-scratch curriculum collapsed loco/tracking during the obstacle phases this seed) rather than a systematic effect — needs a re-seed to confirm/dismiss. (3) Ordering preserved: slam ≥ reactive (discovered-map ≥ lidar-only). Policies now drive straight (loco mean|yaw_rate| ~0.05 vs ~0.22 before), viewable via visualize_all_phases. N=1 caveat stands.
+
+## 2026-07 — scenario_16 slam: more steps DON'T fix weak avoidance (5M ≈ 1M) → bottleneck is plasticity, not budget
+
+Ran slam at 5M steps/phase (vs 1M) to a separate results dir (results/_scn16_slam_5M/, existing results untouched). Phase-2 avoidance checkpoint eval: **0.17 success (30 eps) vs 1M's 0.20 — no improvement.** Killed after phase 2 (combined would be redundant).
+
+**Conclusion:** the ~0.2 avoidance ceiling in the curriculum is NOT a training-budget problem. Contrast: the STANDALONE RC_field slalom (no prior tasks, no EWC constraint) reached ~0.73 avoidance. In scenario_16, RC_c_avoidance is trained AFTER loco+tracking under EWC, whose Fisher-weighted L2 penalty pulls weights back toward the loco/tracking optimum — resisting the large weight change that learning to weave requires. This is the classic STABILITY-PLASTICITY dilemma: EWC gives forgetting≈0 (great stability) but blocks acquisition of the new, harder skill (poor plasticity). The angvel penalty (turning is costly) compounds it.
+
+Testable next: run scenario_16 with NAIVE (no EWC) — if naive learns avoidance markedly better (0.2 → ~0.5+) while forgetting loco/tracking, that confirms EWC's stability is the cost. That would be a clean thesis result (the CL stability-plasticity tradeoff, empirically). Also try lower ewc_lam, and lower/zero angvel on obstacle phases.
