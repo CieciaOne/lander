@@ -515,6 +515,13 @@ class RoverNavEnv(gym.Env):
         # 2× compromise that still shapes smoothness without freezing
         # the policy at random init.
         action_jerk_scale: float = 0.1,
+        # Angular-velocity penalty: -angvel_penalty_scale × yaw_rate² per step.
+        # Discourages "fishtailing" (constant left/right correction that wastes
+        # time + energy and weaves instead of holding a line). Small corrections
+        # are cheap (quadratic); sustained hard turning is costly; genuine turns
+        # around obstacles still pay via progress. Default 0 (off). ~0.15-0.2 is
+        # a good straight-line incentive that still allows obstacle weaving.
+        angvel_penalty_scale: float = 0.0,
         # Wheel-grounded penalty: -wheels_off_scale × n_wheels_off per step.
         # 6 wheels off (rover airborne) costs 0.18/step. Discourages
         # aggressive turns that lift the rocker-bogie clear of the ground.
@@ -659,6 +666,7 @@ class RoverNavEnv(gym.Env):
         self.stuck_in_collision_penalty = stuck_in_collision_penalty
         self.action_jerk_scale = action_jerk_scale
         self.wheels_off_scale = wheels_off_scale
+        self.angvel_penalty_scale = float(angvel_penalty_scale)
         self.action_filter_alpha = float(np.clip(action_filter_alpha, 0.0, 1.0))
         self.waypoint_time_bonus_per_metre = waypoint_time_bonus_per_metre
         self.waypoint_time_bonus_base = waypoint_time_bonus_base
@@ -1578,6 +1586,14 @@ class RoverNavEnv(gym.Env):
         n_wheels_off = self._count_wheels_off_ground()
         wheels_off_penalty = self.wheels_off_scale * float(n_wheels_off)
 
+        # Angular-velocity penalty: discourage constant turning ("fishtailing"),
+        # which wastes time + energy and makes the rover weave instead of holding
+        # a line. Penalises measured yaw-rate squared so small corrections are
+        # cheap but sustained hard turning is costly; necessary turns (around
+        # obstacles) still pay off via the progress reward. Off by default.
+        angvel_z = float(self._sensor(self._base_angvel_id, 3)[2])
+        angvel_penalty = self.angvel_penalty_scale * angvel_z * angvel_z
+
         collision = self._detect_collision()
         # One-shot hit penalty fires on the step the rover *enters* contact, so
         # even brief touches are costly (a 3-step graze without this would only
@@ -1697,6 +1713,7 @@ class RoverNavEnv(gym.Env):
             - (self.stuck_no_progress_penalty if stuck_no_progress and not success else 0.0)
             - action_jerk_penalty
             - wheels_off_penalty
+            - angvel_penalty
             + waypoint_reached_bonus
             + speed_bonus
             + (self.goal_bonus if success else 0.0)
@@ -1743,6 +1760,7 @@ class RoverNavEnv(gym.Env):
                                              if stuck_no_progress and not success else 0.0)),
                 "action_jerk": float(-action_jerk_penalty),
                 "wheels_off": float(-wheels_off_penalty),
+                "angvel": float(-angvel_penalty),
                 "waypoint_bonus": float(waypoint_reached_bonus),
                 "speed_bonus": float(speed_bonus),
                 "goal_bonus": float(self.goal_bonus if success else 0.0),
