@@ -742,7 +742,7 @@ def scenario_15_obstacle_field(
     ekw = dict(use_lidar=True, control_mode="vw", geo_heading_obs=False,
                progress_reward_mode="best", collision_terminate_steps=1,
                collision_penalty=0.0, hit_penalty=5.0,
-               stuck_in_collision_penalty=25.0)
+               stuck_in_collision_penalty=25.0, angvel_penalty_scale=0.15)
     tasks = [
         _make_task(
             "RC_field", train_timesteps, eval_episodes, max_steps,
@@ -788,7 +788,8 @@ def scenario_16_full_curriculum(
     ekw = dict(use_lidar=True, control_mode="vw", progress_reward_mode="best",
                collision_terminate_steps=1, collision_penalty=0.0,
                hit_penalty=8.0, stuck_in_collision_penalty=25.0,
-               proximity_penalty_scale=0.28, proximity_safety_dist=1.8)
+               proximity_penalty_scale=0.28, proximity_safety_dist=1.8,
+               angvel_penalty_scale=0.15)
     phase_terrains = ["RC_c_locomotion", "RC_c_tracking",
                       "RC_c_avoidance", "RC_c_combined"]
     tasks = [
