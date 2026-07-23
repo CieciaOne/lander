@@ -307,3 +307,15 @@ Figure: results/scenario_16_full_curriculum/comparison.png.
 **Debug note (slam training collapse, fixed):** slam initially went to 0.00 on the obstacle-free phases (loco/tracking) while the env was proven navigable (reactive policy 10/10 in it). Root cause: on an empty occupancy map the grid geodesic's heading is a QUANTISED (~±10°) version of the straight bearing, and feeding that biased bearing with no obstacle features gave a misleading progress gradient that froze from-scratch training. Fix: in slam mode the bearing is only bent AFTER real obstacles are discovered (the geodesic is a no-op in open space by design); until then it uses the raw straight bearing (= reactive). Committed.
 
 Caveat: N=1 seed; the retention gaps (slam 0.63 vs priv 0.58 vs react 0.54) are modest and need multi-seed to confirm. Forgetting≈0 is the robust headline.
+
+## 2026-07 — scenario_16 grid RE-RUN with angvel penalty (smooth driving): smoothness ⟂ CL retention (mostly)
+
+Re-ran the EWC × perception curriculum with the anti-wobble angvel penalty (scale 0.15) adopted in the scenario config, so the policies drive straight (for the viewer + energy realism). Full grid (retention / forgetting), vs the earlier no-angvel grid in brackets:
+
+| perception | retention | forgetting | (no-angvel was) |
+|---|---|---|---|
+| slam | 0.617 | 0.008 | (0.633 / 0.033) |
+| reactive | 0.583 | 0.000 | (0.542 / 0.000) |
+| privileged | 0.417 | 0.192 | (0.575 / 0.025) |
+
+**Takeaways:** (1) The smoothness penalty does NOT systematically hurt CL — reactive (forgetting 0.000) and slam (0.008) kept forgetting near-zero WITH it, and reactive retention even improved (0.542→0.583). So smooth driving and retention coexist. (2) privileged is an OUTLIER: retention 0.575→0.417, forgetting 0.025→0.192 (loco −0.4). Given reactive/slam were fine, this is most likely a single-seed instability (geo_heading-truth + angvel + from-scratch curriculum collapsed loco/tracking during the obstacle phases this seed) rather than a systematic effect — needs a re-seed to confirm/dismiss. (3) Ordering preserved: slam ≥ reactive (discovered-map ≥ lidar-only). Policies now drive straight (loco mean|yaw_rate| ~0.05 vs ~0.22 before), viewable via visualize_all_phases. N=1 caveat stands.
